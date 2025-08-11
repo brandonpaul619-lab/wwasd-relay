@@ -1,0 +1,57 @@
+// This Pine v5 script emits the key WWASD indicator states and current price as a JSON payload
+// on each bar close.  It should be applied alongside your existing indicator template so that
+// overlays such as HTF POC, TRAMA, RSI divergence and VRVP remain visible on the chart.
+//
+// When adding this indicator to a chart, leave the `Enable 5m Sniper Mode` unchecked unless
+// you explicitly want 5‑minute alerts.  Alerts should be configured to trigger on “Any alert()
+// function call” and include the chart snapshot.
+
+//@version=5
+indicator("WWASD_State_Emitter", overlay=true)
+
+// --- Inputs ---
+// When true, a 5‑minute timeframe will be scanned along with the default set (1D, 4H, 1H, 15M).
+sniperMode   = input.bool(false, "Enable 5m Sniper Mode")
+
+// --- Helpers ---
+ema(src, len) => ta.ema(src, len)
+bandAbove(basis, mult) => basis * (1 + mult)
+bandBelow(basis, mult) => basis * (1 - mult)
+
+// --- HTF/LTF TVEM approximations ---
+// HTF basis = EMA100 on 12‑hour candles
+htf_close = request.security(syminfo.tickerid, "12H", close, barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema100 = request.security(syminfo.tickerid, "12H", ema(close, 100))
+htf_upper  = bandAbove(htf_ema100, 0.10)
+htf_lower  = bandBelow(htf_ema100, 0.10)
+state_htf  = close > htf_upper ? "above" : (close < htf_lower ? "below" : "inside")
+
+// LTF basis = EMA100 on 4‑hour candles
+ltf_ema100 = request.security(syminfo.tickerid, "240", ema(close, 100))
+ltf_upper  = bandAbove(ltf_ema100, 0.10)
+ltf_lower  = bandBelow(ltf_ema100, 0.10)
+state_ltf  = close > ltf_upper ? "above" : (close < ltf_lower ? "below" : "inside")
+
+// 1D EMA12 & 1D VWAP (session VWAP proxy on daily context)
+d_close    = request.security(syminfo.tickerid, "D", close)
+d_ema12    = request.security(syminfo.tickerid, "D", ema(close, 12))
+state_ema12= d_close >= d_ema12 ? "above" : "below"
+// VWAP uses the current session’s volume‑weighted price on the active timeframe.  In a
+// multi‑timeframe scan, we treat the session VWAP as the intraday proxy for the daily VWAP.
+vwap_val   = ta.vwap(hlc3)
+state_vwap = close >= vwap_val ? "above" : "below"
+
+// --- CMP (current market price) ---
+cmp = close
+
+// --- JSON payload ---
+// timeframe.period returns strings like "15" for 15m, "60" for 1h, "240" for 4h and "D" for daily.
+tf = timeframe.period
+payload = str.format(
+    '{{"type":"WWASD_STATE","symbol":"{0}","tf":"{1}","cmp":{2},' +
+    '"tvem_htf":"{3}","tvem_ltf":"{4}","vwap":"{5}","ema12":"{6}"}}',
+    syminfo.ticker, tf, str.tostring(cmp, format.mintick), state_htf, state_ltf, state_vwap, state_ema12)
+
+// --- Alerts (bar close) ---
+// Emit the payload once per bar close.  TradingView will deliver the payload via webhook.
+alert(payload, alert.freq_once_per_bar_close)

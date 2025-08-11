@@ -1,0 +1,6 @@
+# Ignore environment configuration containing secrets
+.env
+*.pyc
+__pycache__
+node_modules
+.DS_Store
