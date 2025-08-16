@@ -9,15 +9,15 @@ try:
 except Exception:
     redis = None
 
-# -------------------- Env & Config --------------------
+# -------------------- Env --------------------
 SECRET_TOKEN = os.getenv("SECRET_TOKEN")  # optional
-REDIS_URL = os.getenv("REDIS_URL")       # optional
+REDIS_URL = os.getenv("REDIS_URL")        # optional
 GREEN_LIST = os.getenv("GREEN_LIST", "")
 MACRO_LIST = os.getenv("MACRO_LIST", "")
 FULL_LIST  = os.getenv("FULL_LIST", "")
-FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # default 90m
+FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # 90m default
 
-# -------------------- Storage --------------------
+# -------------------- Storage ----------------
 r = None
 if REDIS_URL and redis is not None:
     try:
@@ -25,11 +25,11 @@ if REDIS_URL and redis is not None:
     except Exception:
         r = None
 
-memory_store: Dict[str, Dict[str, Any]] = {}  # last WWASD_STATE per symbol
-recent_events: List[Dict[str, Any]] = []      # other events / charts (optional)
+memory_store: Dict[str, Dict[str, Any]] = {}   # latest WWASD_STATE per symbol
+recent_events: List[Dict[str, Any]] = []       # non-state events (charts, etc.)
 
 # -------------------- App --------------------
-app = FastAPI(title="WWASD Relay v2", version="1.1.0")
+app = FastAPI(title="WWASD Relay v2.1", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,10 +38,7 @@ app.add_middleware(
 )
 
 # Regex helpers
-macro_re   = re.compile(r"^[A-Z0-9:\._\-]+$")
 perp_noslash_re = re.compile(r"^[A-Z0-9]+USDT\.P$")
-perp_slash_re   = re.compile(r"^[A-Z0-9]+/USDT\.P$")
-
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -49,10 +46,8 @@ def normalize_symbol(sym: Optional[str]) -> Optional[str]:
     if not sym:
         return sym
     s = str(sym).strip().upper()
-    # strip vendor prefix (e.g., BLOFIN:)
-    if ":" in s:
+    if ":" in s:  # drop vendor prefix
         s = s.split(":", 1)[1]
-    # add slash for perps if missing
     if perp_noslash_re.match(s) and "/" not in s:
         s = s.replace("USDT.P", "/USDT.P")
     return s
@@ -62,9 +57,9 @@ def pick_list(name: Optional[str]) -> List[str]:
         return []
     name = name.lower().strip()
     mapping = {
-        "green": [s.strip() for s in GREEN_LIST.split(",") if s.strip()],
-        "macro": [s.strip() for s in MACRO_LIST.split(",") if s.strip()],
-        "full":  [s.strip() for s in FULL_LIST.split(",") if s.strip()],
+        "green": [s.strip().upper() for s in GREEN_LIST.split(",") if s.strip()],
+        "macro": [s.strip().upper() for s in MACRO_LIST.split(",") if s.strip()],
+        "full":  [s.strip().upper() for s in FULL_LIST.split(",") if s.strip()],
     }
     return mapping.get(name, [])
 
@@ -93,7 +88,6 @@ def load_states() -> Dict[str, Dict[str, Any]]:
                     out[s] = json.loads(raw)
         except Exception:
             pass
-    # overlay in-memory
     out.update(memory_store)
     return out
 
@@ -105,9 +99,9 @@ async def health():
 async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)):
     """
     Accepts:
-    - JSON body with Pine alert payload nested under "message" (TradingView Any alert() function call)
-    - Raw JSON body already shaped like WWASD_STATE
-    - multipart/form-data from automation (e.g., screenshots) — stored as recent events only
+    - JSON body with Pine alert payload nested under "message" (Any alert() function call)
+    - Raw JSON already shaped like WWASD_STATE
+    - multipart/form-data from automation (e.g., screenshots)
     """
     # Optional token check
     if SECRET_TOKEN:
@@ -123,23 +117,23 @@ async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)
 
     ctype = request.headers.get("content-type", "")
     if "multipart/form-data" in ctype:
-        # Accept screenshots / breadcrumbs without strict schema
         form = await request.form()
-        fields = {k: str(v) for k, v in form.items()}
+        fields = {k: (str(v) if not hasattr(v, "filename") else v.filename) for k, v in form.items()}
         symbol = normalize_symbol(fields.get("symbol") or fields.get("ticker"))
         payload = {
-            **fields,
+            **{k: str(v) for k, v in fields.items() if k != "image"},
             "symbol": symbol,
             "type": fields.get("type") or "chart",
             "server_received_ms": now_ms(),
             "is_chart": True,
+            "has_image": "image" in form,
         }
         recent_events.append(payload)
         if len(recent_events) > 2000:
             recent_events.pop(0)
         return {"ok": True, "ingested": "chart"}
 
-    # Otherwise parse JSON
+    # JSON path
     try:
         body = await request.json()
     except Exception:
@@ -149,7 +143,7 @@ async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # If message is a JSON string, merge it
+    # If Pine put JSON inside "message", merge it
     if isinstance(body, dict) and isinstance(body.get("message"), str):
         try:
             inner = json.loads(body["message"])
@@ -158,12 +152,11 @@ async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)
         except Exception:
             pass
 
-    # Normalize symbol
     symbol = normalize_symbol(body.get("symbol") or body.get("ticker"))
     if symbol:
         body["symbol"] = symbol
 
-    # Save WWASD_STATE, store others as recent events
+    # Save state or record as recent event
     if body.get("type") == "WWASD_STATE" and symbol:
         body["server_received_ms"] = now_ms()
         save_state(body)
@@ -177,34 +170,35 @@ async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)
 
 @app.get("/tv/latest")
 async def latest(
-    list: Optional[str] = None,
+    list_name: Optional[str] = Query(default=None, alias="list"),  # << use ?list=green|macro|full
     symbols: Optional[str] = None,
     max_age_secs: Optional[int] = None,
     max_items: int = 500,
 ):
-    states = list(load_states().values())
+    # Load all known states
+    states_list = list(load_states().values())
 
-    # Filter by list or explicit symbols
-    subset: set = set()
+    # Filter by watchlist name or explicit symbols
+    wanted: set = set()
     if symbols:
-        subset.update({normalize_symbol(s) for s in symbols.split(",") if s.strip()})
-    wl = pick_list(list)
+        wanted.update({normalize_symbol(s) for s in symbols.split(",") if s.strip()})
+    wl = pick_list(list_name)
     if wl:
-        subset.update({normalize_symbol(s) for s in wl})
-    if subset:
-        states = [s for s in states if normalize_symbol(s.get("symbol")) in subset]
+        wanted.update({normalize_symbol(s) for s in wl})
+    if wanted:
+        states_list = [s for s in states_list if normalize_symbol(s.get("symbol")) in wanted]
 
     # Age filter
     if max_age_secs is not None:
         cutoff = now_ms() - int(max_age_secs) * 1000
-        states = [s for s in states if int(s.get("server_received_ms", 0)) >= cutoff]
+        states_list = [s for s in states_list if int(s.get("server_received_ms", 0)) >= cutoff]
 
     # Sort newest first
-    states.sort(key=lambda s: s.get("server_received_ms", 0), reverse=True)
+    states_list.sort(key=lambda s: s.get("server_received_ms", 0), reverse=True)
 
     # Freshness flag
     fresh_cutoff_ms = now_ms() - FRESH_CUTOFF_SECS * 1000
-    for s in states:
+    for s in states_list:
         s["is_fresh"] = int(s.get("server_received_ms", 0)) >= fresh_cutoff_ms
 
-    return {"count": len(states[:max_items]), "items": states[:max_items]}
+    return {"count": len(states_list[:max_items]), "items": states_list[:max_items]}
