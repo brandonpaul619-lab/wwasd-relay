@@ -1,204 +1,128 @@
-import os, time, json, re
-from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, Request, HTTPException, Query
+# app.py  — WWASD Relay v2 (TV + Blofin)
+import os
+import time
+import json
+from typing import Dict, Any, List, Optional
+
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
-try:
-    import redis  # optional
-except Exception:
-    redis = None
-
-# -------------------- Env --------------------
-SECRET_TOKEN = os.getenv("SECRET_TOKEN")  # optional
-REDIS_URL = os.getenv("REDIS_URL")        # optional
-GREEN_LIST = os.getenv("GREEN_LIST", "")
-MACRO_LIST = os.getenv("MACRO_LIST", "")
-FULL_LIST  = os.getenv("FULL_LIST", "")
-FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # 90m default
-
-# -------------------- Storage ----------------
-r = None
-if REDIS_URL and redis is not None:
-    try:
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-    except Exception:
-        r = None
-
-memory_store: Dict[str, Dict[str, Any]] = {}   # latest WWASD_STATE per symbol
-recent_events: List[Dict[str, Any]] = []       # non-state events (charts, etc.)
-
-# -------------------- App --------------------
-app = FastAPI(title="WWASD Relay v2.1", version="1.1.1")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Regex helpers
-perp_noslash_re = re.compile(r"^[A-Z0-9]+USDT\.P$")
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-def normalize_symbol(sym: Optional[str]) -> Optional[str]:
-    if not sym:
-        return sym
-    s = str(sym).strip().upper()
-    if ":" in s:  # drop vendor prefix
-        s = s.split(":", 1)[1]
-    if perp_noslash_re.match(s) and "/" not in s:
-        s = s.replace("USDT.P", "/USDT.P")
-    return s
+def split_env_list(name: str) -> List[str]:
+    raw = os.getenv(name, "")
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-def pick_list(name: Optional[str]) -> List[str]:
-    if not name:
-        return []
-    name = name.lower().strip()
-    mapping = {
-        "green": [s.strip().upper() for s in GREEN_LIST.split(",") if s.strip()],
-        "macro": [s.strip().upper() for s in MACRO_LIST.split(",") if s.strip()],
-        "full":  [s.strip().upper() for s in FULL_LIST.split(",") if s.strip()],
-    }
-    return mapping.get(name, [])
+GREEN_LIST = split_env_list("GREEN_LIST")
+MACRO_LIST = split_env_list("MACRO_LIST")
+FULL_LIST  = split_env_list("FULL_LIST")
 
-def save_state(state: Dict[str, Any]) -> None:
-    sym = state.get("symbol")
-    if not sym:
+FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # default 90 min
+AUTH_SHARED_SECRET = os.getenv("AUTH_SHARED_SECRET", "").strip()  # optional
+
+app = FastAPI(title="WWASD Relay")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+# In‑memory caches
+state_by_symbol: Dict[str, Dict[str, Any]] = {}  # latest WWASD_STATE per symbol
+blofin_positions: Optional[Dict[str, Any]] = None  # latest BLOFIN_POSITIONS snapshot
+
+def require_secret_if_set(req: Request, body: Dict[str, Any]):
+    if not AUTH_SHARED_SECRET:
         return
-    key = f"state:{sym}"
-    data = json.dumps(state, separators=(",", ":"))
-    if r:
-        try:
-            r.set(key, data)
-            r.sadd("symbols", sym)
-        except Exception:
-            pass
-    memory_store[sym] = state
-
-def load_states() -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    if r:
-        try:
-            syms = r.smembers("symbols")
-            for s in syms:
-                raw = r.get(f"state:{s}")
-                if raw:
-                    out[s] = json.loads(raw)
-        except Exception:
-            pass
-    out.update(memory_store)
-    return out
+    qs_token = req.query_params.get("token")
+    body_token = body.get("token")
+    if (qs_token or body_token) and (qs_token == AUTH_SHARED_SECRET or body_token == AUTH_SHARED_SECRET):
+        return
+    raise HTTPException(status_code=403, detail="Unauthorized")
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "time": int(time.time()), "count": len(memory_store)}
+def health():
+    return {"ok": True, "time": int(time.time()), "count": len(state_by_symbol)}
 
 @app.post("/tv")
-async def tv_ingest(request: Request, token: Optional[str] = Query(default=None)):
+async def tv_ingest(request: Request):
     """
     Accepts:
-    - JSON body with Pine alert payload nested under "message" (Any alert() function call)
-    - Raw JSON already shaped like WWASD_STATE
-    - multipart/form-data from automation (e.g., screenshots)
+      - TradingView alerts (JSON or form/multipart with a JSON 'message' field)
+      - Any JSON with 'type' == 'WWASD_STATE' (per-symbol state)
+      - Any JSON with 'type' == 'BLOFIN_POSITIONS' (account snapshot)
     """
-    # Optional token check
-    if SECRET_TOKEN:
-        supplied = token
-        if not supplied:
-            try:
-                tmp = await request.json()
-                supplied = tmp.get("token")
-            except Exception:
-                supplied = None
-        if supplied != SECRET_TOKEN:
-            raise HTTPException(status_code=401, detail="bad token")
-
-    ctype = request.headers.get("content-type", "")
-    if "multipart/form-data" in ctype:
-        form = await request.form()
-        fields = {k: (str(v) if not hasattr(v, "filename") else v.filename) for k, v in form.items()}
-        symbol = normalize_symbol(fields.get("symbol") or fields.get("ticker"))
-        payload = {
-            **{k: str(v) for k, v in fields.items() if k != "image"},
-            "symbol": symbol,
-            "type": fields.get("type") or "chart",
-            "server_received_ms": now_ms(),
-            "is_chart": True,
-            "has_image": "image" in form,
-        }
-        recent_events.append(payload)
-        if len(recent_events) > 2000:
-            recent_events.pop(0)
-        return {"ok": True, "ingested": "chart"}
-
-    # JSON path
     try:
-        body = await request.json()
-    except Exception:
-        raw = await request.body()
-        try:
-            body = json.loads(raw.decode("utf-8", "ignore"))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = await request.json()
+        else:
+            # TV can send as form-encoded; pull JSON out of 'message' or raw body.
+            try:
+                form = await request.form()
+                payload = form.get("message") or form.get("payload") or ""
+                data = json.loads(payload) if payload else {}
+            except Exception:
+                raw = await request.body()
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad payload: {e}")
 
-    # If Pine put JSON inside "message", merge it
-    if isinstance(body, dict) and isinstance(body.get("message"), str):
-        try:
-            inner = json.loads(body["message"])
-            for k, v in inner.items():
-                body.setdefault(k, v)
-        except Exception:
-            pass
+    data["server_received_ms"] = now_ms()
 
-    symbol = normalize_symbol(body.get("symbol") or body.get("ticker"))
-    if symbol:
-        body["symbol"] = symbol
+    # Optional shared secret
+    require_secret_if_set(request, data)
 
-    # Save state or record as recent event
-    if body.get("type") == "WWASD_STATE" and symbol:
-        body["server_received_ms"] = now_ms()
-        save_state(body)
-    else:
-        body["server_received_ms"] = now_ms()
-        recent_events.append(body)
-        if len(recent_events) > 2000:
-            recent_events.pop(0)
+    typ = str(data.get("type", "")).upper()
 
-    return {"ok": True}
+    if typ == "WWASD_STATE":
+        sym = str(data.get("symbol", "")).upper()
+        if not sym:
+            raise HTTPException(status_code=400, detail="Missing symbol for WWASD_STATE")
+        state_by_symbol[sym] = data
+        return {"ok": True, "stored": sym}
+
+    if typ == "BLOFIN_POSITIONS":
+        global blofin_positions
+        blofin_positions = data
+        return {"ok": True, "stored": "blofin_positions"}
+
+    # Unknown types are accepted (no-op)
+    return {"ok": True, "ignored": True}
+
+def filter_symbols(list_name: str) -> Optional[set]:
+    ln = (list_name or "").lower().strip()
+    if ln == "green":
+        return set(GREEN_LIST)
+    if ln == "macro":
+        return set(MACRO_LIST)
+    if ln == "full":
+        return set(FULL_LIST)
+    return None
 
 @app.get("/tv/latest")
-async def latest(
-    list_name: Optional[str] = Query(default=None, alias="list"),  # << use ?list=green|macro|full
-    symbols: Optional[str] = None,
-    max_age_secs: Optional[int] = None,
-    max_items: int = 500,
-):
-    # Load all known states
-    states_list = list(load_states().values())
+def tv_latest(list: str = "", max_age_secs: int = FRESH_CUTOFF_SECS):
+    sel = filter_symbols(list)
+    now = now_ms()
+    items: List[Dict[str, Any]] = []
+    for sym, item in state_by_symbol.items():
+        if sel is not None and sym not in sel:
+            continue
+        fresh = (now - item.get("server_received_ms", now)) <= max_age_secs * 1000
+        out = dict(item)
+        out["is_fresh"] = fresh
+        items.append(out)
 
-    # Filter by watchlist name or explicit symbols
-    wanted: set = set()
-    if symbols:
-        wanted.update({normalize_symbol(s) for s in symbols.split(",") if s.strip()})
-    wl = pick_list(list_name)
-    if wl:
-        wanted.update({normalize_symbol(s) for s in wl})
-    if wanted:
-        states_list = [s for s in states_list if normalize_symbol(s.get("symbol")) in wanted]
+    items.sort(key=lambda x: x.get("symbol", ""))
+    return {"count": len(items), "items": items}
 
-    # Age filter
-    if max_age_secs is not None:
-        cutoff = now_ms() - int(max_age_secs) * 1000
-        states_list = [s for s in states_list if int(s.get("server_received_ms", 0)) >= cutoff]
+@app.get("/blofin/latest")
+def blofin_latest(max_age_secs: int = 900):  # default: 15 minutes freshness window
+    if not blofin_positions:
+        return {"fresh": False, "ts": None, "data": None}
+    now = now_ms()
+    fresh = (now - blofin_positions.get("server_received_ms", now)) <= max_age_secs * 1000
+    return {"fresh": fresh, "ts": blofin_positions.get("server_received_ms"), "data": blofin_positions}
 
-    # Sort newest first
-    states_list.sort(key=lambda s: s.get("server_received_ms", 0), reverse=True)
-
-    # Freshness flag
-    fresh_cutoff_ms = now_ms() - FRESH_CUTOFF_SECS * 1000
-    for s in states_list:
-        s["is_fresh"] = int(s.get("server_received_ms", 0)) >= fresh_cutoff_ms
 
     return {"count": len(states_list[:max_items]), "items": states_list[:max_items]}
