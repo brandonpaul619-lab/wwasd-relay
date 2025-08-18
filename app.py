@@ -1,12 +1,13 @@
-# app.py  — WWASD Relay v2 (TV + Blofin)
+# app.py — WWASD Relay v2.2 (TV + Blofin + Snap)
 import os
+import re
 import time
 import json
 import hmac
 import hashlib
 import base64
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Iterable
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -14,23 +15,84 @@ from starlette.middleware.cors import CORSMiddleware
 
 
 # ------------------------------
-# Helpers & env
+# Helpers & normalization
 # ------------------------------
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def split_env_list(name: str) -> List[str]:
+_MACRO_BARE_HINTS = ("TOTAL",)  # e.g., TOTAL, TOTAL2, TOTAL3, TOTALA
+_MACRO_SUFFIX_HINTS = (".D", ".C")  # e.g., USDT.D, BTC.D, OTHERS.D, MEME.C
+
+
+def looks_like_macro_bare(sym_no_ns: str) -> bool:
+    """Heuristic: bare macro tickers (without CRYPTOCAP:)."""
+    u = sym_no_ns.upper()
+    return (
+        u.startswith(_MACRO_BARE_HINTS)
+        or any(u.endswith(sfx) for sfx in _MACRO_SUFFIX_HINTS)
+    )
+
+
+def canonical_symbol(sym: str) -> str:
+    """
+    Normalize common forms used by TradingView alerts into a single canonical key.
+
+    Examples:
+      LINK/USDT.P       -> BLOFIN:LINKUSDT.P
+      LINKUSDT.P        -> BLOFIN:LINKUSDT.P
+      BLOFIN:LINKUSDT.P -> BLOFIN:LINKUSDT.P
+      TOTAL3            -> CRYPTOCAP:TOTAL3
+      USDT.D            -> CRYPTOCAP:USDT.D
+      CRYPTOCAP:TOTAL3  -> CRYPTOCAP:TOTAL3
+    """
+    s = (sym or "").strip().upper().replace(" ", "")
+    if not s:
+        return s
+
+    # Already namespaced
+    if ":" in s:
+        ns, rest = s.split(":", 1)
+        if ns == "BLOFIN":
+            # Sometimes TV can emit BLOFIN:LINK/USDT.P
+            rest = rest.replace("/", "")
+            return f"{ns}:{rest}"
+        return f"{ns}:{rest}"
+
+    # Macro (bare)
+    if looks_like_macro_bare(s):
+        return f"CRYPTOCAP:{s}"
+
+    # Blofin USDT perps (no namespace)
+    if "/USDT.P" in s:
+        return f"BLOFIN:{s.replace('/', '')}"
+    if s.endswith("USDT.P"):
+        return f"BLOFIN:{s}"
+
+    # Fallback: return as-is (uppercased)
+    return s
+
+
+def _split_env_list(name: str) -> List[str]:
     raw = os.getenv(name, "")
-    # Normalize to UPPER w/out whitespace
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+    out: List[str] = []
+    for piece in raw.split(","):
+        tok = piece.strip()
+        if not tok:
+            continue
+        out.append(canonical_symbol(tok))
+    return out
 
 
-# Watchlists
-GREEN_LIST = split_env_list("GREEN_LIST")
-MACRO_LIST = split_env_list("MACRO_LIST")
-FULL_LIST  = split_env_list("FULL_LIST")
+# ------------------------------
+# Env & config
+# ------------------------------
+
+# Watchlists (any mix of forms; we normalize above)
+GREEN_LIST = _split_env_list("GREEN_LIST")
+MACRO_LIST = _split_env_list("MACRO_LIST")
+FULL_LIST  = _split_env_list("FULL_LIST")
 
 # Freshness window for /tv/latest
 FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # default 90m
@@ -39,13 +101,13 @@ FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # default 90m
 AUTH_SHARED_SECRET = os.getenv("AUTH_SHARED_SECRET", "").strip()
 
 # Blofin creds (optional; needed only for /blofin/* pull-through routes)
-BLOFIN_BASE_URL = os.getenv("BLOFIN_BASE_URL", "https://openapi.blofin.com").rstrip("/")
-BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY", "")
+BLOFIN_BASE_URL  = os.getenv("BLOFIN_BASE_URL", "https://openapi.blofin.com").rstrip("/")
+BLOFIN_API_KEY   = os.getenv("BLOFIN_API_KEY", "")
 BLOFIN_API_SECRET = os.getenv("BLOFIN_API_SECRET", "")
 BLOFIN_PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE", "")
 
-# Blofin paths (keep default unless Blofin changes them)
-BLOFIN_BALANCES_PATH = os.getenv("BLOFIN_BALANCES_PATH", "/api/v5/account/balance")
+# Blofin paths
+BLOFIN_BALANCES_PATH  = os.getenv("BLOFIN_BALANCES_PATH", "/api/v5/account/balance")
 BLOFIN_POSITIONS_PATH = os.getenv("BLOFIN_POSITIONS_PATH", "/api/v5/account/positions")
 
 
@@ -66,7 +128,7 @@ app.add_middleware(
 # In-memory caches
 # ------------------------------
 
-# Latest per-symbol TradingView WWASD_STATE
+# Latest per-symbol TradingView WWASD_STATE (keyed by canonical symbol)
 state_by_symbol: Dict[str, Dict[str, Any]] = {}
 
 # Latest push-based Blofin snapshot (type == BLOFIN_POSITIONS) if you post it to /tv
@@ -94,7 +156,12 @@ def require_secret_if_set(req: Request, body: Dict[str, Any]) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "wwasd-relay", "docs": "/docs"}
+    return {
+        "ok": True,
+        "service": "wwasd-relay",
+        "version": "2.2",
+        "docs": "/docs",
+    }
 
 
 @app.get("/health")
@@ -102,9 +169,52 @@ def health():
     return {"ok": True, "time": int(time.time()), "count": len(state_by_symbol)}
 
 
+@app.get("/tv/symbols")
+def tv_symbols():
+    """Quick debug: see normalized watchlists as the server sees them."""
+    return {
+        "green": sorted(set(GREEN_LIST)),
+        "macro": sorted(set(MACRO_LIST)),
+        "full":  sorted(set(FULL_LIST)),
+        "stored_keys": sorted(state_by_symbol.keys()),
+    }
+
+
 # ------------------------------
 # TradingView ingest
 # ------------------------------
+
+def _coerce_json_from_tv_request(raw_body: bytes, content_type: str, form_obj: Optional[dict]) -> Dict[str, Any]:
+    """
+    TV sometimes posts as:
+      - application/json (already JSON)
+      - form/multipart with a 'message'/'payload' string containing JSON
+      - raw text/bytes that are JSON
+    """
+    data: Dict[str, Any] = {}
+    if "application/json" in (content_type or ""):
+        try:
+            data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Bad JSON: {e}")
+    else:
+        # try form('message'/'payload')
+        if form_obj:
+            payload = form_obj.get("message") or form_obj.get("payload") or ""
+            if payload:
+                try:
+                    data = json.loads(payload)
+                    return data
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Bad form JSON: {e}")
+        # try raw
+        if raw_body:
+            try:
+                data = json.loads(raw_body.decode("utf-8"))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Bad payload: {e}")
+    return data
+
 
 @app.post("/tv")
 async def tv_ingest(request: Request):
@@ -114,23 +224,17 @@ async def tv_ingest(request: Request):
       - Any JSON with 'type' == 'WWASD_STATE' (per-symbol state)
       - Any JSON with 'type' == 'BLOFIN_POSITIONS' (account snapshot you push in)
     """
-    try:
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            data = await request.json()
-        else:
-            # TV often posts form-encoded; JSON lives in 'message' (or 'payload')
-            try:
-                form = await request.form()
-                payload = form.get("message") or form.get("payload") or ""
-                data = json.loads(payload) if payload else {}
-            except Exception:
-                raw = await request.body()
-                data = json.loads(raw.decode("utf-8")) if raw else {}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bad payload: {e}")
+    # Read body safely (support both JSON & form)
+    content_type = request.headers.get("content-type", "")
+    form_obj = None
+    raw = await request.body()
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        try:
+            form_obj = await request.form()
+        except Exception:
+            form_obj = None
 
-    # Stamp server receipt time
+    data = _coerce_json_from_tv_request(raw, content_type, form_obj) if (raw or form_obj) else {}
     data["server_received_ms"] = now_ms()
 
     # Optional secret check
@@ -139,9 +243,14 @@ async def tv_ingest(request: Request):
     typ = str(data.get("type", "")).upper()
 
     if typ == "WWASD_STATE":
-        sym = str(data.get("symbol", "")).upper()
-        if not sym:
+        raw_sym = str(data.get("symbol", "")).strip()
+        if not raw_sym:
             raise HTTPException(status_code=400, detail="Missing symbol for WWASD_STATE")
+        sym = canonical_symbol(raw_sym)
+        # Store canonical; keep raw for transparency if different
+        if raw_sym.upper() != sym:
+            data["raw_symbol"] = raw_sym.upper()
+        data["symbol"] = sym
         state_by_symbol[sym] = data
         return {"ok": True, "stored": sym}
 
@@ -171,6 +280,10 @@ def tv_latest(list: str = "", max_age_secs: int = FRESH_CUTOFF_SECS):
     sel = _filter_symbols(list)
     now = now_ms()
     items: List[Dict[str, Any]] = []
+
+    # Because we store by canonical keys, also canonicalize the filter set
+    if sel is not None:
+        sel = set(canonical_symbol(s) for s in sel)
 
     for sym, item in state_by_symbol.items():
         if sel is not None and sym not in sel:
@@ -248,3 +361,24 @@ def blofin_balances():
 def blofin_positions():
     """Direct GET to Blofin positions (read-only)."""
     return _blofin_get(BLOFIN_POSITIONS_PATH)
+
+
+# ------------------------------
+# Snapshot aggregator (green/macro/full + port)
+# ------------------------------
+
+@app.get("/snap")
+def snap(
+    lists: str = "green,macro",      # comma list: green,macro,full
+    fresh_only: bool = True,         # drop stale rows by default
+    max_age_secs: int = FRESH_CUTOFF_SECS,
+):
+    out: Dict[str, Any] = {"ts": now_ms()}
+    for name in [s.strip().lower() for s in lists.split(",") if s.strip()]:
+        bucket = tv_latest(list=name, max_age_secs=max_age_secs)
+        if fresh_only:
+            bucket["items"] = [it for it in bucket["items"] if it.get("is_fresh")]
+            bucket["count"] = len(bucket["items"])
+        out[name] = bucket
+    out["port"] = blofin_latest(max_age_secs=900)
+    return out
