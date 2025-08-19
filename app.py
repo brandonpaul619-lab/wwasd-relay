@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Iterable
 import requests
 from fastapi import FastAPI, Request, HTTPException
 from starlette.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 
 
 # ------------------------------
@@ -382,3 +383,161 @@ def snap(
         out[name] = bucket
     out["port"] = blofin_latest(max_age_secs=900)
     return out
+
+# ------------------------------
+# Public mirrors for /snap (HTML + JSON)
+# ------------------------------
+
+@app.get("/snap.raw")
+def snap_raw(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """JSON mirror of the /snap aggregator for external readers."""
+    # Reuse existing /snap function logic directly
+    data = snap(lists=lists, fresh_only=bool(fresh_only), max_age_secs=max_age_secs)
+    return JSONResponse(content=data)
+
+@app.get("/snap.html", response_class=HTMLResponse)
+def snap_html(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """Human-readable mirror of /snap (pretty-printed JSON) for browsers."""
+    data = snap(lists=lists, fresh_only=bool(fresh_only), max_age_secs=max_age_secs)
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>WWASD Snap</title>"
+        "<style>body{font-family:system-ui,Segoe UI,Arial;padding:16px}"
+        "code{background:#f3f3f3;padding:2px 4px;border-radius:4px}"
+        "pre{white-space:pre-wrap;word-break:break-word}</style>"
+        "<h1>WWASD Snapshot</h1>"
+        f"<p><strong>lists</strong>=<code>{lists}</code> · "
+        f"<strong>fresh_only</strong>=<code>{bool(fresh_only)}</code> · "
+        f"<strong>max_age_secs</strong>=<code>{max_age_secs}</code></p>"
+        "<pre>" + json.dumps(data, indent=2) + "</pre>"
+    )
+    return HTMLResponse(content=body)
+# =========================
+# WWASD DESK Mirror Routes
+# Paste this block at the END of app.py (after your existing routes)
+# =========================
+
+from typing import Optional
+import json
+from fastapi.responses import HTMLResponse, JSONResponse
+
+# --- helpers to resolve your existing aggregator functions safely ---
+def _resolve_snap(lists: str = "green,macro,full", fresh_only: bool = True, max_age_secs: Optional[int] = None):
+    """
+    Calls your existing snap aggregator in a safe/compatible way.
+    Tries get_snap(...) first; if not present, tries snap(...).
+    """
+    # Try helper-style aggregator
+    try:
+        return get_snap(lists=lists, fresh_only=fresh_only) if max_age_secs is None else get_snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    except NameError:
+        pass
+    except Exception:
+        # If get_snap exists but signature differs, try best-effort fallback
+        try:
+            return get_snap(lists=lists, fresh_only=fresh_only)
+        except Exception:
+            pass
+
+    # Try route-style function named `snap`
+    try:
+        return snap(lists=lists, fresh_only=fresh_only) if max_age_secs is None else snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    except NameError:
+        pass
+    except Exception:
+        # Try minimal signature
+        try:
+            return snap(lists=lists, fresh_only=fresh_only)
+        except Exception as e:
+            raise RuntimeError(f"WWASD mirror could not call your snap aggregator: {e}")
+
+    raise RuntimeError("WWASD mirror could not find get_snap(...) or snap(...). Please expose one of those names.")
+
+def _resolve_port_latest():
+    """
+    Calls your existing blofin portfolio fetcher.
+    Tries get_blofin_latest() first, then blofin_latest(), then /blofin/latest route func if exposed.
+    """
+    # Preferred helper
+    try:
+        return get_blofin_latest()
+    except NameError:
+        pass
+    except Exception:
+        # If exists with different signature, try anyway
+        try:
+            return get_blofin_latest()
+        except Exception:
+            pass
+
+    # Alternate helper name
+    try:
+        return blofin_latest()
+    except NameError:
+        pass
+    except Exception:
+        try:
+            return blofin_latest()
+        except Exception as e:
+            raise RuntimeError(f"WWASD mirror could not call your portfolio getter: {e}")
+
+    # If neither helper is available, you can import the function your /blofin/latest route uses and call it here.
+    raise RuntimeError("WWASD mirror could not find get_blofin_latest() or blofin_latest(). Please expose one of those names.")
+
+# --- mirror endpoints ---
+@app.get("/snap.raw")
+def wwasd_snap_raw(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: Optional[int] = None):
+    """
+    JSON mirror of your existing /snap aggregator.
+    Access example:
+      /snap.raw?lists=green,macro,full&fresh_only=1
+      /snap.raw?lists=green&fresh_only=0&max_age_secs=1800
+    """
+    data = _resolve_snap(lists=lists, fresh_only=bool(fresh_only), max_age_secs=max_age_secs)
+    return JSONResponse(content=data)
+
+@app.get("/snap.html", response_class=HTMLResponse)
+def wwasd_snap_html(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: Optional[int] = None):
+    """
+    Human-readable mirror (pretty-printed JSON) for browsers and external tools.
+    """
+    data = _resolve_snap(lists=lists, fresh_only=bool(fresh_only), max_age_secs=max_age_secs)
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>WWASD Snap</title>"
+        "<style>body{font-family:system-ui,Segoe UI,Arial;padding:16px}"
+        "h1{margin:0 0 8px 0} code{background:#f2f2f2;padding:2px 6px;border-radius:6px}"
+        "pre{white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e5e7eb;padding:12px;border-radius:8px;}</style>"
+        "<h1>WWASD Snapshot</h1>"
+        f"<p><strong>lists</strong>=<code>{lists}</code> · <strong>fresh_only</strong>=<code>{bool(fresh_only)}</code>"
+        + (f" · <strong>max_age_secs</strong>=<code>{max_age_secs}</code>" if max_age_secs is not None else "")
+        + "</p>"
+        "<pre>" + json.dumps(data, indent=2) + "</pre>"
+    )
+    return HTMLResponse(content=body)
+
+@app.get("/port.raw")
+def wwasd_port_raw():
+    """
+    JSON mirror of your Blofin latest portfolio snapshot.
+    Access example:
+      /port.raw
+    """
+    data = _resolve_port_latest()
+    return JSONResponse(content=data)
+
+@app.get("/port.html", response_class=HTMLResponse)
+def wwasd_port_html():
+    """
+    Human-readable HTML view of Blofin positions.
+    Access example:
+      /port.html
+    """
+    data = _resolve_port_latest()
+    body = (
+        "<!doctype html><meta charset='utf-8'><title>WWASD Port</title>"
+        "<style>body{font-family:system-ui,Segoe UI,Arial;padding:16px}"
+        "h1{margin:0 0 8px 0} code{background:#f2f2f2;padding:2px 6px;border-radius:6px}"
+        "pre{white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e5e7eb;padding:12px;border-radius:8px;}</style>"
+        "<h1>Blofin Portfolio Snapshot</h1>"
+        "<pre>" + json.dumps(data, indent=2) + "</pre>"
+    )
+    return HTMLResponse(content=body)
