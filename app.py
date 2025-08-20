@@ -756,3 +756,171 @@ def port2_html():
 </html>
 """
     return HTMLResponse(html)
+# ================== INDICATORS (12EMA D + QVWAP) ==================
+import time
+from fastapi import Request, HTTPException
+
+AUTH_SHARED_SECRET = os.getenv("AUTH_SHARED_SECRET", "")
+
+# in‑memory indicator state keyed by symbol, e.g. "BTC-USDT"
+INDICATORS = {"ts": 0, "data": {}}
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+@app.post("/tv_indicators")
+async def tv_indicators(req: Request):
+    """TradingView webhook endpoint for indicator values.
+       URL must include ?token=AUTH_SHARED_SECRET
+       Body: {"type":"INDICATORS","data":[{"sym":"BTC-USDT","ema12d":..., "qvwap":..., "ts":...}, ...]}
+    """
+    token = req.query_params.get("token", "")
+    if not AUTH_SHARED_SECRET or token != AUTH_SHARED_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    try:
+        payload = await req.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"bad json: {e}")
+
+    items = (payload or {}).get("data", [])
+    now = _now_ms()
+    for it in items:
+        sym = (it.get("sym") or it.get("symbol") or "").upper()
+        if not sym:
+            continue
+        INDICATORS["data"][sym] = {
+            "ema12d": float(it.get("ema12d")) if it.get("ema12d") is not None else None,
+            "qvwap":  float(it.get("qvwap"))  if it.get("qvwap")  is not None else None,
+            "ts":     int(it.get("ts") or now),
+        }
+        INDICATORS["ts"] = now
+    return {"ok": True, "stored": len(items)}
+
+@app.get("/indicators/latest")
+def indicators_latest():
+    ts = INDICATORS.get("ts", 0)
+    fresh = bool(ts and (_now_ms() - ts) < 180_000)  # 3 min freshness
+    return {"fresh": fresh, "ts": ts, "data": INDICATORS}
+
+# -------- Pretty Port page (with EMA/QVWAP columns) --------
+@app.get("/port2.html")
+def port2_html():
+    from fastapi.responses import HTMLResponse
+    html = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WWASD Port</title>
+  <style>
+    :root { --bg:#0b0b0c; --card:#141417; --muted:#9aa0a6; --pos:#18c964; --neg:#ff4d4f; --text:#e6e6e6; }
+    html,body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;margin:0}
+    .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 12px}
+    .meta{color:var(--muted);margin:6px 0 16px}
+    table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden}
+    th,td{padding:10px 8px;border-bottom:1px solid #232327;text-align:right;white-space:nowrap}
+    th{font-weight:600;text-align:left;background:#1b1b20}
+    tr:last-child td{border-bottom:none}
+    .sym{font-weight:600;text-align:left}
+    .pos{color:var(--pos);font-weight:600}
+    .neg{color:var(--neg);font-weight:600}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1e1e24;color:#d0d0d0;font-size:12px}
+    .fresh{color:var(--pos)} .stale{color:var(--neg)}
+    .small{font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WWASD Port <span id="fresh" class="pill">loading…</span></h1>
+    <div id="meta" class="meta">Fetching latest…</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Type</th>
+          <th>Side</th>
+          <th>Qty</th>
+          <th>Avg</th>
+          <th>Mark</th>
+          <th>uPnL</th>
+          <th>Lev</th>
+          <th>Liq</th>
+          <th>EMA12 (D)</th>
+          <th>QVWAP</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="11" class="small">Waiting for data…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const $ = (s)=>document.querySelector(s);
+    const fmt = (n, d=6) => {
+      if (n===null || n===undefined || n==="") return "";
+      const x = Number(n); if (!isFinite(x)) return n;
+      return x.toLocaleString(undefined, {maximumFractionDigits:d});
+    };
+
+    async function load(){
+      try{
+        // 1) Positions
+        const resP = await fetch('/blofin/latest?x=' + Date.now(), {cache:'no-store'});
+        const jp   = await resP.json();
+        const latestTs = jp.ts ? new Date(jp.ts).toLocaleString() : '—';
+        const fresh = !!jp.fresh;
+        const raw   = (((jp||{}).data||{}).data||{});
+        const items = Array.isArray(raw.data) ? raw.data : [];
+
+        // 2) Indicators
+        const resI = await fetch('/indicators/latest?x=' + Date.now(), {cache:'no-store'});
+        const ji   = await resI.json();
+        const ind  = (((ji||{}).data||{}).data||{}); // { "BTC-USDT": {ema12d:..., qvwap:...}, ... }
+
+        // header/meta
+        $('#fresh').textContent = fresh ? 'fresh' : 'stale';
+        $('#fresh').className   = 'pill ' + (fresh ? 'fresh' : 'stale');
+
+        // rows
+        let pnlTotal = 0;
+        let rows = items.map(p=>{
+          const sym = String(p.instId||'').toUpperCase();
+          const pnl = Number(p.unrealizedPnl || 0) || 0;
+          pnlTotal += pnl;
+          const cls = pnl >= 0 ? 'pos' : 'neg';
+          const ii  = ind[sym] || {};
+          return `<tr>
+            <td class="sym">${sym}</td>
+            <td>${p.instType||''}</td>
+            <td>${p.positionSide||''}</td>
+            <td>${fmt(p.positions,6)}</td>
+            <td>${fmt(p.averagePrice,6)}</td>
+            <td>${fmt(p.markPrice,6)}</td>
+            <td class="${cls}">${fmt(p.unrealizedPnl,4)}</td>
+            <td>${p.leverage||''}</td>
+            <td>${fmt(p.liquidationPrice,6)}</td>
+            <td>${fmt(ii.ema12d,6)}</td>
+            <td>${fmt(ii.qvwap,6)}</td>
+          </tr>`;
+        }).join('');
+
+        if (!rows) rows = `<tr><td colspan="11" class="small">No open positions.</td></tr>`;
+        $('#rows').innerHTML = rows;
+
+        const totalCls = (pnlTotal>=0?'pos':'neg');
+        $('#meta').innerHTML = `Updated: ${latestTs} • uPnL total: <b class="${totalCls}">${fmt(pnlTotal,4)}</b>`;
+      }catch(e){
+        $('#rows').innerHTML = `<tr><td colspan="11" class="small">Error: ${String(e).slice(0,200)}</td></tr>`;
+        $('#fresh').textContent = 'error'; $('#fresh').className='pill stale';
+      }
+    }
+    load(); setInterval(load, 15000);
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
