@@ -541,3 +541,110 @@ def wwasd_port_html():
         "<pre>" + json.dumps(data, indent=2) + "</pre>"
     )
     return HTMLResponse(content=body)
+# -------- Pretty Port page (read-only view over /blofin/latest) --------
+@app.get("/port2.html")
+def port2_html():
+    # We return raw HTML; no template engine needed; doesn't touch TV routes.
+    from fastapi import Response
+    html = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WWASD Port</title>
+  <style>
+    :root { --bg:#0b0b0c; --card:#141417; --muted:#9aa0a6; --pos:#18c964; --neg:#ff4d4f; --text:#e6e6e6; }
+    html,body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif;margin:0}
+    .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 12px}
+    .meta{color:var(--muted);margin:6px 0 16px}
+    table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden}
+    th,td{padding:10px 8px;border-bottom:1px solid #232327;text-align:right;white-space:nowrap}
+    th{font-weight:600;text-align:left;background:#1b1b20}
+    tr:last-child td{border-bottom:none}
+    .sym{font-weight:600;text-align:left}
+    .pos{color:var(--pos);font-weight:600}
+    .neg{color:var(--neg);font-weight:600}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1e1e24;color:#d0d0d0;font-size:12px}
+    .fresh{color:var(--pos)} .stale{color:var(--neg)}
+    .small{font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WWASD Port <span id="fresh" class="pill">loading…</span></h1>
+    <div id="meta" class="meta">Fetching latest…</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Type</th>
+          <th>Side</th>
+          <th>Qty</th>
+          <th>Avg</th>
+          <th>Mark</th>
+          <th>uPnL</th>
+          <th>Lev</th>
+          <th>Liq</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="9" class="small">Waiting for data…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const $ = (s)=>document.querySelector(s);
+    const fmt = (n, d=6) => {
+      if (n===null || n===undefined || n==="") return "";
+      const x = Number(n); if (!isFinite(x)) return n;
+      return x.toLocaleString(undefined, {maximumFractionDigits:d});
+    };
+    async function load(){
+      try{
+        const res = await fetch('/blofin/latest?x=' + Date.now(), {cache:'no-store'});
+        const j   = await res.json();
+        const latestTs = j.ts ? new Date(j.ts).toLocaleString() : '—';
+        const fresh = !!j.fresh;
+        const raw   = (((j||{}).data||{}).data||{});         // raw BloFin envelope
+        const items = Array.isArray(raw.data) ? raw.data : []; // positions array
+
+        // header meta
+        $('#fresh').textContent = fresh ? 'fresh' : 'stale';
+        $('#fresh').className   = 'pill ' + (fresh ? 'fresh' : 'stale');
+        let pnlTotal = 0;
+
+        // rows
+        let rows = items.map(p=>{
+          const pnl = Number(p.unrealizedPnl || 0) || 0;
+          pnlTotal += pnl;
+          const cls = pnl >= 0 ? 'pos' : 'neg';
+          return `<tr>
+            <td class="sym">${p.instId||''}</td>
+            <td>${p.instType||''}</td>
+            <td>${p.positionSide||''}</td>
+            <td>${fmt(p.positions,6)}</td>
+            <td>${fmt(p.averagePrice,6)}</td>
+            <td>${fmt(p.markPrice,6)}</td>
+            <td class="${cls}">${fmt(p.unrealizedPnl,4)}</td>
+            <td>${p.leverage||''}</td>
+            <td>${fmt(p.liquidationPrice,6)}</td>
+          </tr>`;
+        }).join('');
+
+        if (!rows) rows = `<tr><td colspan="9" class="small">No open positions.</td></tr>`;
+        $('#rows').innerHTML = rows;
+        $('#meta').innerHTML = `Updated: ${latestTs} • uPnL total: <b class="${pnlTotal>=0?'pos':'neg'}">${fmt(pnlTotal,4)}</b>`;
+      }catch(e){
+        $('#rows').innerHTML = `<tr><td colspan="9" class="small">Error: ${String(e).slice(0,200)}</td></tr>`;
+        $('#fresh').textContent = 'error'; $('#fresh').className='pill stale';
+      }
+    }
+    load(); setInterval(load, 15000);
+  </script>
+</body>
+</html>
+"""
+    return Response(content=html, media_type="text/html")
