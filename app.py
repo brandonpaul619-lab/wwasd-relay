@@ -924,3 +924,67 @@ def port2_html():
 </html>
 """
     return HTMLResponse(html)
+# -------- Server-rendered Port (for bots / no-JS clients) --------
+@app.get("/port2_ssr.html")
+def port2_ssr():
+    from fastapi.responses import HTMLResponse
+
+    latest = blofin_latest()
+    fresh  = "✅ fresh" if latest.get("fresh") else "⚠️ stale"
+    ts     = latest.get("ts")
+
+    data   = (((latest or {}).get("data") or {}).get("data") or {})
+    items  = data.get("data") or []
+
+    def cell(x): 
+        return "" if x is None else str(x)
+
+    rows = []
+    for p in items:
+        rows.append(f"""
+          <tr>
+            <td>{cell(p.get('instId'))}</td>
+            <td>{cell(p.get('instType'))}</td>
+            <td>{cell(p.get('positionSide'))}</td>
+            <td>{cell(p.get('positions'))}</td>
+            <td>{cell(p.get('averagePrice'))}</td>
+            <td>{cell(p.get('markPrice'))}</td>
+            <td>{cell(p.get('unrealizedPnl'))}</td>
+            <td>{cell(p.get('leverage'))}</td>
+            <td>{cell(p.get('liquidationPrice'))}</td>
+          </tr>
+        """)
+
+    rows_html = "".join(rows) or "<tr><td colspan='9'>No open positions</td></tr>"
+
+    html = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <title>WWASD Port (SSR)</title>
+        <meta http-equiv="refresh" content="15">
+        <style>
+          body{{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:24px}}
+          table{{border-collapse:collapse;width:100%}}
+          th,td{{border:1px solid #ddd;padding:8px;text-align:right;white-space:nowrap}}
+          th{{text-align:left;background:#f6f6f6}}
+          .pill{{display:inline-block;padding:2px 8px;border-radius:999px;background:#eee;margin-left:8px}}
+        </style>
+      </head>
+      <body>
+        <h2>WWASD Port (SSR)<span class="pill">{fresh}</span></h2>
+        <div>ts: {ts}</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Type</th><th>Side</th><th>Qty</th>
+              <th>Avg</th><th>Mark</th><th>uPnL</th><th>x</th><th>Liq</th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
