@@ -924,9 +924,3 @@ def port2_html():
 </html>
 """
     return HTMLResponse(html)
-# -------- Capital Lock Protocol mode --------
-CAPITAL_MODE = os.getenv("CAPITAL_MODE", "Normal")  # Default is Normal
-
-@app.get("/capital/mode")
-def get_capital_mode():
-    return {"mode": CAPITAL_MODE}
