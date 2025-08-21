@@ -924,20 +924,3 @@ def port2_html():
 </html>
 """
     return HTMLResponse(html)
-# Server-rendered Port snapshot (no JS; safe for bots)
-@app.get("/port_ssr.txt")
-def port_ssr_text():
-    latest = blofin_latest()
-    fresh  = latest.get("fresh", False)
-    ts     = latest.get("ts")
-    data   = (((latest or {}).get("data") or {}).get("data") or {})
-    items  = data.get("data") or []
-    lines = [f"fresh={fresh} ts={ts} count={len(items)}"]
-    for p in items:
-        lines.append(
-            f"{p.get('instId','')} {p.get('instType','')} {p.get('positionSide','')} "
-            f"qty={p.get('positions','')} avg={p.get('averagePrice','')} mark={p.get('markPrice','')} "
-            f"uPnL={p.get('unrealizedPnl','')} lev={p.get('leverage','')} liq={p.get('liquidationPrice','')}"
-        )
-    from fastapi import Response
-    return Response("\n".join(lines), media_type="text/plain; charset=utf-8")
