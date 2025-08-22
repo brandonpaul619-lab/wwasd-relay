@@ -1,250 +1,246 @@
-# app.py — WWASD Relay (tolerant /tv ingest, no behavior surprises)
-# - Auth via ?token= accepts AUTH_SHARED_SECRET or AUTL_SHARED_SECRET
-# - Normalizes TradingView payloads:
-#     * unwraps "message":"{...}"
-#     * if data is a JSON string -> json.loads
-#     * accepts sym/l -> symbol/list
-#     * ensures tf is a string ("5","15","60",...)
-# - Keeps default freshness windows as you run them today.
-#
-# Endpoints:
-#   POST /tv                -> ingest WWASD_STATE (and friends)
-#   GET  /tv/latest         -> recent TV events (with "fresh" flag)
-#   GET  /blofin/latest     -> latest Port block (default 15m freshness)
-#   POST /blofin/push       -> optional authenticated port pusher
-#   GET  /snap              -> grouped snapshot for WWASD HTML
-#   GET  /port2_ssr.html    -> simple SSR port view
+# app.py — WWASD Relay v2.1 (robust lists + tolerant matching + /snap)
+import os, time, json, hmac, hashlib, base64, datetime
+from typing import Dict, Any, List, Optional, Set
 
-import os, json, time
-from typing import Any, Dict, List, Tuple
+import requests
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from starlette.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="wwasd-relay")
+# ---------------- utils ----------------
+def now_ms() -> int: 
+    return int(time.time() * 1000)
 
-# ----------------------------- config ---------------------------------
-# Site-wide "fresh" window for TV items (unchanged from your current default).
-FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # 90 minutes
+def _strip(s: str) -> str:
+    return (s or "").strip().strip('"\'' ).strip()
 
-# Accept either name for the shared secret (matches your Render env)
-AUTH_SHARED_SECRET = (
-    os.getenv("AUTH_SHARED_SECRET")
-    or os.getenv("AUTL_SHARED_SECRET")
-    or ""
-)
+def _upper(s: str) -> str:
+    return _strip(s).upper()
 
-# ----------------------------- in-memory stores -----------------------
-_tv_items: List[Dict[str, Any]] = []       # raw (but normalized) TV events
-_tv_ts: float = 0.0
+def _split_env_list(name: str) -> List[str]:
+    raw = os.getenv(name, "")
+    # tolerate full-string quotes and escaped newlines
+    raw = raw.replace("\\n", " ").replace("\n", " ")
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+    toks = [ _upper(t) for t in raw.split(",") if _upper(t) ]
+    return toks
 
-_port_obj: Dict[str, Any] = {"positions": []}  # whatever your pusher sends
-_port_ts: float = 0.0
+def _norm_variants(sym: str) -> Set[str]:
+    """
+    Matching variants:
+      - uppercase & trimmed
+      - strip vendor prefix before colon (BLOFIN:, CRYPTOCAP:, etc.)
+      - slash/no-slash variants for pairs like LINK/USDT.P ↔ LINKUSDT.P
+    """
+    out: Set[str] = set()
+    s = _upper(sym)
+    out.add(s)
 
-def _now() -> float:
-    return time.time()
+    # strip prefix before colon
+    core = s.split(":", 1)[1] if ":" in s else s
+    out.add(core)
 
-def _is_fresh(ts: float, window: int) -> bool:
-    return ts and (_now() - ts) <= window
+    # slash <-> no-slash
+    if "/" in core:
+        out.add(core.replace("/", ""))
+    else:
+        # reinsert slash before USDT.P if present
+        if core.endswith("USDT.P") and "/" not in core:
+            base = core[:-6]  # drop 'USDT.P'
+            out.add(f"{base}/USDT.P")
 
-# ----------------------------- helpers --------------------------------
-def _unwrap_tradingview(payload: Any) -> Any:
-    """Unwrap TV 'message' wrapper and de-stringify inner data if needed."""
-    try:
-        if isinstance(payload, dict) and "message" in payload:
-            try:
-                payload = json.loads(payload["message"])
-            except Exception:
-                # keep as-is if not json
-                pass
-        # decode inner data if it's a JSON string
-        if isinstance(payload, dict) and isinstance(payload.get("data"), str):
-            try:
-                payload["data"] = json.loads(payload["data"])
-            except Exception:
-                pass
-        # normalize variants
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            d = payload["data"]
-            if "symbol" not in d and "sym" in d:
-                d["symbol"] = d["sym"]
-            if "list" not in d and "l" in d:
-                d["list"] = d["l"]
-            if "tf" in d:
-                d["tf"] = str(d["tf"])
-            payload["data"] = d
-    except Exception:
-        # never explode on bad inputs
-        pass
-    return payload
+    return out
 
-def _project_item(p: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a compact view for /snap consumers."""
-    t = p.get("type")
-    d = p.get("data") if isinstance(p.get("data"), dict) else {}
-    return {
-        "type": t,
-        "list": d.get("list"),
-        "symbol": d.get("symbol"),
-        "tf": d.get("tf"),
-        "ts": p.get("ts", _now()),
-        "state": d.get("state"),   # if your Pine includes it
-    }
+def _make_selector(name: str) -> Set[str]:
+    toks = _split_env_list(name)
+    out: Set[str] = set()
+    for t in toks:
+        out |= _norm_variants(t)
+    return out
 
-# ----------------------------- endpoints ------------------------------
+# ---------------- env ----------------
+GREEN_LIST = _split_env_list("GREEN_LIST")
+MACRO_LIST = _split_env_list("MACRO_LIST")
+FULL_LIST  = _split_env_list("FULL_LIST")
+
+SEL_GREEN = _make_selector("GREEN_LIST")
+SEL_MACRO = _make_selector("MACRO_LIST")
+SEL_FULL  = _make_selector("FULL_LIST")
+
+FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # 90m default
+AUTH_SHARED_SECRET = _strip(os.getenv("AUTH_SHARED_SECRET", ""))
+
+# Optional Blofin pull-through (read-only; push path is via /tv type=BLOFIN_POSITIONS)
+BLOFIN_BASE_URL    = _strip(os.getenv("BLOFIN_BASE_URL", "https://openapi.blofin.com").rstrip("/"))
+BLOFIN_API_KEY     = _strip(os.getenv("BLOFIN_API_KEY", ""))
+BLOFIN_API_SECRET  = _strip(os.getenv("BLOFIN_API_SECRET", ""))
+BLOFIN_PASSPHRASE  = _strip(os.getenv("BLOFIN_PASSPHRASE", ""))
+BLOFIN_BALANCES_PATH  = _strip(os.getenv("BLOFIN_BALANCES_PATH", "/api/v5/account/balance"))
+BLOFIN_POSITIONS_PATH = _strip(os.getenv("BLOFIN_POSITIONS_PATH", "/api/v5/account/positions"))
+
+# ---------------- app ----------------
+app = FastAPI(title="WWASD Relay")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ---------------- state ----------------
+state_by_symbol: Dict[str, Dict[str, Any]] = {}
+blofin_positions_push: Optional[Dict[str, Any]] = None
+
+# ---------------- helpers ----------------
+def require_secret_if_set(req: Request, body: Dict[str, Any]) -> None:
+    if not AUTH_SHARED_SECRET:
+        return
+    qs = req.query_params.get("token")
+    bj = body.get("token")
+    if (qs or bj) and (qs == AUTH_SHARED_SECRET or bj == AUTH_SHARED_SECRET):
+        return
+    raise HTTPException(status_code=403, detail="Unauthorized")
+
+def _fresh(item: Dict[str, Any], max_age_secs: int) -> bool:
+    now = now_ms()
+    return (now - item.get("server_received_ms", now)) <= max_age_secs * 1000
+
+def _list_selector(name: str) -> Optional[Set[str]]:
+    ln = (name or "").lower()
+    if ln == "green": return SEL_GREEN
+    if ln == "macro": return SEL_MACRO
+    if ln == "full":  return SEL_FULL
+    return None
+
+def _in_named_list(sym: str, list_name: str) -> bool:
+    sel = _list_selector(list_name)
+    if sel is None:
+        return True
+    return bool(_norm_variants(sym) & sel)
+
+# ---------------- routes ----------------
+@app.get("/")
+def root(): 
+    return {"ok": True, "service": "wwasd-relay", "docs": "/docs"}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "time": int(time.time()), "count": len(state_by_symbol)}
+
 @app.post("/tv")
-async def tv_ingest(req: Request):
-    # ---- auth
-    token = req.query_params.get("token", "")
-    if AUTH_SHARED_SECRET and token != AUTH_SHARED_SECRET:
-        raise HTTPException(status_code=403, detail="invalid token")
-
-    # ---- parse body (JSON or raw)
+async def tv_ingest(request: Request):
+    """
+    Accepts:
+      - TradingView alerts (JSON or form/multipart with 'message' JSON)
+      - Any JSON with 'type' == 'WWASD_STATE' (per-symbol state)
+      - Any JSON with 'type' == 'BLOFIN_POSITIONS' (account snapshot you push in)
+    """
     try:
-        payload = await req.json()
-    except Exception:
-        raw = (await req.body()).decode("utf-8", "ignore")
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            payload = {"raw": raw}
+        ctype = request.headers.get("content-type", "")
+        if "application/json" in ctype:
+            data = await request.json()
+        else:
+            try:
+                form = await request.form()
+                payload = form.get("message") or form.get("payload") or ""
+                data = json.loads(payload) if payload else {}
+            except Exception:
+                raw = await request.body()
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad payload: {e}")
 
-    # ---- normalize
-    payload = _unwrap_tradingview(payload)
+    data["server_received_ms"] = now_ms()
+    require_secret_if_set(request, data)
 
-    # ---- detect/optionally capture port pushes that arrive here
-    # If your pusher sends {"type":"BLOFIN_POSITIONS","data":{...port...}}
-    try:
-        if isinstance(payload, dict) and payload.get("type") == "BLOFIN_POSITIONS":
-            global _port_obj, _port_ts
-            d = payload.get("data") or {}
-            _port_obj = d if isinstance(d, dict) else {"positions": []}
-            _port_ts = _now()
-    except Exception:
-        pass
+    typ = _upper(str(data.get("type", "")))
 
-    # ---- store TV event (keep last 400)
-    global _tv_items, _tv_ts
-    payload["ts"] = _now()
-    _tv_items.append(payload)
-    _tv_items = _tv_items[-400:]
-    _tv_ts = payload["ts"]
+    if typ == "WWASD_STATE":
+        sym = _upper(str(data.get("symbol", "")))
+        if not sym: 
+            raise HTTPException(status_code=400, detail="Missing symbol")
+        state_by_symbol[sym] = data
+        return {"ok": True, "stored": sym}
 
-    # minimal = looks like a real WWASD emitter event
-    minimal = (
-        isinstance(payload, dict)
-        and isinstance(payload.get("data"), dict)
-        and bool(payload["data"].get("symbol"))
-        and bool(payload["data"].get("tf"))
-    )
-    return JSONResponse({"ok": True, "stored": minimal})
+    if typ == "BLOFIN_POSITIONS":
+        global blofin_positions_push
+        blofin_positions_push = data
+        return {"ok": True, "stored": "blofin_positions"}
+
+    return {"ok": True, "ignored": True}
 
 @app.get("/tv/latest")
-def tv_latest():
-    return JSONResponse({
-        "fresh": _is_fresh(_tv_ts, FRESH_CUTOFF_SECS),
-        "cutoff_secs": FRESH_CUTOFF_SECS,
-        "ts": _tv_ts,
-        "items": _tv_items,
-    })
-
-@app.get("/blofin/latest")
-def blofin_latest(max_age_secs: int = 900):
-    """Port block for SSR/HTML; default 15m window (unchanged)."""
-    return JSONResponse({
-        "fresh": _is_fresh(_port_ts, max_age_secs),
-        "ts": _port_ts,
-        "port": _port_obj,
-    })
-
-@app.post("/blofin/push")
-async def blofin_push(req: Request):
-    """Optional authenticated pusher for positions (use token=?)."""
-    token = req.query_params.get("token", "")
-    if AUTH_SHARED_SECRET and token != AUTH_SHARED_SECRET:
-        raise HTTPException(status_code=403, detail="invalid token")
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
-    global _port_obj, _port_ts
-    _port_obj = body if isinstance(body, dict) else {"positions": []}
-    _port_ts = _now()
-    return JSONResponse({"ok": True, "ts": _port_ts})
+def tv_latest(list: str = "", max_age_secs: int = FRESH_CUTOFF_SECS):
+    items: List[Dict[str, Any]] = []
+    for sym, item in state_by_symbol.items():
+        if list and not _in_named_list(sym, list):
+            continue
+        out = dict(item)
+        out["is_fresh"] = _fresh(item, max_age_secs)
+        items.append(out)
+    items.sort(key=lambda x: x.get("symbol", ""))
+    return {"count": len(items), "items": items}
 
 @app.get("/snap")
-def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = None):
-    """
-    Snapshot used by the WWASD HTML.
-    - groups TV items by list name ("green","macro","full")
-    - respects fresh_only: if 1, filters by (max_age_secs or FRESH_CUTOFF_SECS)
-    """
-    wanted = [s.strip() for s in lists.split(",") if s.strip()]
-    age = max_age_secs if (fresh_only and max_age_secs) else (FRESH_CUTOFF_SECS if fresh_only else 10**9)
-    cutoff = _now() - age if fresh_only else 0
+def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    wanted = [ _strip(x).lower() for x in lists.split(",") if _strip(x) ]
+    if not wanted: 
+        wanted = ["green"]
+    resp: Dict[str, Any] = {"ts": now_ms(), "lists": {}}
+    for name in wanted:
+        data = tv_latest(list=name, max_age_secs=max_age_secs)
+        if fresh_only:
+            data["items"] = [it for it in data["items"] if it.get("is_fresh")]
+            data["count"] = len(data["items"])
+        resp["lists"][name] = data
+    return resp
 
-    grouped: Dict[str, List[Dict[str, Any]]] = {k: [] for k in wanted}
-    for it in _tv_items:
-        ts = it.get("ts", 0)
-        if fresh_only and ts < cutoff:
-            continue
-        d = it.get("data") or {}
-        li = (d.get("list") or d.get("l"))
-        if li in grouped:
-            grouped[li].append(_project_item(it))
-
-    out = {
-        "ts": _now(),
-        "tv_cutoff_secs": FRESH_CUTOFF_SECS,
-        "fresh_only": bool(fresh_only),
-        "lists": wanted,
-        "port": {
-            "fresh": _is_fresh(_port_ts, 900),
-            "ts": _port_ts,
-            "data": _port_obj,
-        }
+# ---- push-based Blofin snapshot (via /tv type=BLOFIN_POSITIONS) ----
+@app.get("/blofin/latest")
+def blofin_latest(max_age_secs: int = 900):
+    if not blofin_positions_push:
+        return {"fresh": False, "ts": None, "data": None}
+    now = now_ms()
+    fresh = _fresh(blofin_positions_push, max_age_secs)
+    return {
+        "fresh": fresh,
+        "ts": blofin_positions_push.get("server_received_ms"),
+        "data": blofin_positions_push,
     }
-    for k in wanted:
-        items = grouped.get(k, [])
-        out[k] = {"count": len(items), "items": items}
-    return JSONResponse(out)
 
-@app.get("/port2_ssr.html")
-def port_ssr():
-    """Very small SSR page for quick eyeballing of the port."""
-    fresh = _is_fresh(_port_ts, 900)
-    badge = "fresh" if fresh else "stale"
-    rows = []
-    positions = (_port_obj or {}).get("positions") or []
-    if positions:
-        for p in positions:
-            rows.append(
-                f"<tr><td>{p.get('symbol','')}</td>"
-                f"<td>{p.get('type','')}</td>"
-                f"<td>{p.get('side','')}</td>"
-                f"<td>{p.get('qty','')}</td>"
-                f"<td>{p.get('avg','')}</td>"
-                f"<td>{p.get('mark','')}</td>"
-                f"<td>{p.get('upnl','')}</td>"
-                f"<td>{p.get('x','')}</td>"
-                f"<td>{p.get('liq','')}</td></tr>"
-            )
-    else:
-        rows.append('<tr><td colspan="9">No open positions</td></tr>')
+# ---- optional Blofin pull-through (read-only) ----
+def _iso_ts() -> str:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\
+        .isoformat(timespec="milliseconds").replace("+00:00","Z")
 
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>WWASD Port (SSR)</title>
-<style>
-body{{font-family:ui-sans-serif,system-ui,Segoe UI,Arial;margin:18px}}
-.badge{{display:inline-block;padding:3px 7px;border-radius:6px;color:#fff;background:{'#16a34a' if fresh else '#f59e0b'};}}
-table{{border-collapse:collapse;width:100%;margin-top:10px}}
-th,td{{border:1px solid #ddd;padding:6px;text-align:left;white-space:nowrap}}
-</style></head><body>
-<h2>WWASD Port (SSR) <span class="badge">{badge}</span></h2>
-<div>ts: {(_port_ts and int(_port_ts)) or 'None'}</div>
-<table>
-<tr><th>Symbol</th><th>Type</th><th>Side</th><th>Qty</th><th>Avg</th><th>Mark</th><th>uPnL</th><th>x</th><th>Liq</th></tr>
-{''.join(rows)}
-</table>
-</body></html>"""
-    return HTMLResponse(html)
+def _blofin_headers(method: str, path: str, body: str = "") -> Dict[str, str]:
+    if not (BLOFIN_BASE_URL and BLOFIN_API_KEY and BLOFIN_API_SECRET and BLOFIN_PASSPHRASE):
+        raise HTTPException(status_code=503, detail="Blofin credentials not configured on server.")
+    ts = _iso_ts()
+    prehash = f"{ts}{method.upper()}{path}{body}"
+    sign = base64.b64encode(
+        hmac.new(BLOFIN_API_SECRET.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+    return {
+        "OK-ACCESS-KEY": BLOFIN_API_KEY,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": BLOFIN_PASSPHRASE,
+        "Content-Type": "application/json",
+    }
+
+def _blofin_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not path.startswith("/"): 
+        path = "/" + path
+    url = f"{BLOFIN_BASE_URL}{path}"
+    headers = _blofin_headers("GET", path, "")
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    try: 
+        j = r.json()
+    except Exception: 
+        j = {"raw": r.text}
+    return {"status": r.status_code, "json": j}
+
+@app.get("/blofin/balances")
+def blofin_balances():  
+    return _blofin_get(BLOFIN_BALANCES_PATH)
+
+@app.get("/blofin/positions")
+def blofin_positions(): 
+    return _blofin_get(BLOFIN_POSITIONS_PATH)
 
