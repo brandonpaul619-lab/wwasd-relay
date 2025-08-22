@@ -1,13 +1,19 @@
-# app.py — WWASD Relay v2.1 (robust lists + tolerant matching + /snap)
+# app.py — WWASD Relay v2.2
+# - Robust GREEN/FULL/MACRO list handling (strips quotes/newlines, tolerates vendor prefixes + slash/no-slash)
+# - /tv ingest for TradingView + BloFin pushes
+# - /snap for WWASD (lists=green,macro,full; fresh_only=1)
+# - /blofin/latest JSON and /port2_ssr.html HTML (SSR) for the Port view
+
 import os, time, json, hmac, hashlib, base64, datetime
 from typing import Dict, Any, List, Optional, Set
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 from starlette.middleware.cors import CORSMiddleware
 
 # ---------------- utils ----------------
-def now_ms() -> int: 
+def now_ms() -> int:
     return int(time.time() * 1000)
 
 def _strip(s: str) -> str:
@@ -18,7 +24,6 @@ def _upper(s: str) -> str:
 
 def _split_env_list(name: str) -> List[str]:
     raw = os.getenv(name, "")
-    # tolerate full-string quotes and escaped newlines
     raw = raw.replace("\\n", " ").replace("\n", " ")
     if raw.startswith('"') and raw.endswith('"'):
         raw = raw[1:-1]
@@ -26,29 +31,17 @@ def _split_env_list(name: str) -> List[str]:
     return toks
 
 def _norm_variants(sym: str) -> Set[str]:
-    """
-    Matching variants:
-      - uppercase & trimmed
-      - strip vendor prefix before colon (BLOFIN:, CRYPTOCAP:, etc.)
-      - slash/no-slash variants for pairs like LINK/USDT.P ↔ LINKUSDT.P
-    """
     out: Set[str] = set()
     s = _upper(sym)
     out.add(s)
-
-    # strip prefix before colon
     core = s.split(":", 1)[1] if ":" in s else s
     out.add(core)
-
-    # slash <-> no-slash
     if "/" in core:
         out.add(core.replace("/", ""))
     else:
-        # reinsert slash before USDT.P if present
         if core.endswith("USDT.P") and "/" not in core:
-            base = core[:-6]  # drop 'USDT.P'
+            base = core[:-6]
             out.add(f"{base}/USDT.P")
-
     return out
 
 def _make_selector(name: str) -> Set[str]:
@@ -67,10 +60,9 @@ SEL_GREEN = _make_selector("GREEN_LIST")
 SEL_MACRO = _make_selector("MACRO_LIST")
 SEL_FULL  = _make_selector("FULL_LIST")
 
-FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # 90m default
+FRESH_CUTOFF_SECS = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))
 AUTH_SHARED_SECRET = _strip(os.getenv("AUTH_SHARED_SECRET", ""))
 
-# Optional Blofin pull-through (read-only; push path is via /tv type=BLOFIN_POSITIONS)
 BLOFIN_BASE_URL    = _strip(os.getenv("BLOFIN_BASE_URL", "https://openapi.blofin.com").rstrip("/"))
 BLOFIN_API_KEY     = _strip(os.getenv("BLOFIN_API_KEY", ""))
 BLOFIN_API_SECRET  = _strip(os.getenv("BLOFIN_API_SECRET", ""))
@@ -79,7 +71,7 @@ BLOFIN_BALANCES_PATH  = _strip(os.getenv("BLOFIN_BALANCES_PATH", "/api/v5/accoun
 BLOFIN_POSITIONS_PATH = _strip(os.getenv("BLOFIN_POSITIONS_PATH", "/api/v5/account/positions"))
 
 # ---------------- app ----------------
-app = FastAPI(title="WWASD Relay")
+app = FastAPI(title="WWASD Relay v2.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ---------------- state ----------------
@@ -115,21 +107,15 @@ def _in_named_list(sym: str, list_name: str) -> bool:
 
 # ---------------- routes ----------------
 @app.get("/")
-def root(): 
+def root():
     return {"ok": True, "service": "wwasd-relay", "docs": "/docs"}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "time": int(time.time()), "count": len(state_by_symbol)}
+    return {"ok": True, "time": int(time.time()), "tv_count": len(state_by_symbol), "port_cached": bool(blofin_positions_push)}
 
 @app.post("/tv")
 async def tv_ingest(request: Request):
-    """
-    Accepts:
-      - TradingView alerts (JSON or form/multipart with 'message' JSON)
-      - Any JSON with 'type' == 'WWASD_STATE' (per-symbol state)
-      - Any JSON with 'type' == 'BLOFIN_POSITIONS' (account snapshot you push in)
-    """
     try:
         ctype = request.headers.get("content-type", "")
         if "application/json" in ctype:
@@ -152,7 +138,7 @@ async def tv_ingest(request: Request):
 
     if typ == "WWASD_STATE":
         sym = _upper(str(data.get("symbol", "")))
-        if not sym: 
+        if not sym:
             raise HTTPException(status_code=400, detail="Missing symbol")
         state_by_symbol[sym] = data
         return {"ok": True, "stored": sym}
@@ -179,7 +165,7 @@ def tv_latest(list: str = "", max_age_secs: int = FRESH_CUTOFF_SECS):
 @app.get("/snap")
 def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
     wanted = [ _strip(x).lower() for x in lists.split(",") if _strip(x) ]
-    if not wanted: 
+    if not wanted:
         wanted = ["green"]
     resp: Dict[str, Any] = {"ts": now_ms(), "lists": {}}
     for name in wanted:
@@ -190,12 +176,10 @@ def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int
         resp["lists"][name] = data
     return resp
 
-# ---- push-based Blofin snapshot (via /tv type=BLOFIN_POSITIONS) ----
 @app.get("/blofin/latest")
 def blofin_latest(max_age_secs: int = 900):
     if not blofin_positions_push:
         return {"fresh": False, "ts": None, "data": None}
-    now = now_ms()
     fresh = _fresh(blofin_positions_push, max_age_secs)
     return {
         "fresh": fresh,
@@ -203,7 +187,56 @@ def blofin_latest(max_age_secs: int = 900):
         "data": blofin_positions_push,
     }
 
-# ---- optional Blofin pull-through (read-only) ----
+# ------------- Port SSR -------------
+def _render_port_html(payload: Optional[Dict[str, Any]]) -> str:
+    ts = ""
+    fresh_tag = ""
+    rows = ""
+    if payload and payload.get("data"):
+        ts_ms = payload.get("ts") or payload["data"].get("server_received_ms") or now_ms()
+        ts = datetime.datetime.fromtimestamp(int(ts_ms)/1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        fresh_tag = "fresh" if payload.get("fresh") else "stale"
+        # expect { type: "BLOFIN_POSITIONS", data: {...} }
+        positions = (payload["data"].get("data") or {}).get("data") or []
+        if isinstance(positions, dict):
+            positions = positions.get("positions", [])
+        for p in positions:
+            inst = str(p.get("instId") or p.get("symbol") or "")
+            side = str(p.get("posSide") or p.get("side") or "").upper()
+            sz   = str(p.get("pos") or p.get("size") or "")
+            avg  = str(p.get("avgPx") or p.get("avg") or "")
+            mark = str(p.get("markPx") or p.get("mark") or "")
+            lev  = str(p.get("lever") or p.get("leverage") or "")
+            rows += f"<tr><td>{inst}</td><td>{side}</td><td>{sz}</td><td>{avg}</td><td>{mark}</td><td>{lev}</td></tr>"
+    if not rows:
+        rows = "<tr><td colspan='6'>No open positions</td></tr>"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"/><title>Port SSR</title>
+<style>
+body{{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0b0f14;color:#e6edf3;margin:0;padding:20px}}
+h1{{font-size:18px;margin:0 0 8px 0}}
+small{{color:#9aa7b2}}
+table{{width:100%;border-collapse:collapse;margin-top:10px}}
+th,td{{border-bottom:1px solid #1f2937;padding:8px 6px;text-align:left;font-size:14px}}
+.tag{{display:inline-block;padding:2px 8px;border-radius:6px;background:#1f2937;margin-left:8px}}
+.tag.fresh{{background:#064e3b}} .tag.stale{{background:#4a044e}}
+</style></head>
+<body>
+<h1>WWASD Port <span class="tag {fresh_tag}">{fresh_tag or "unknown"}</span></h1>
+<small>Last update (server): {ts}</small>
+<table>
+<thead><tr><th>Instrument</th><th>Side</th><th>Sz</th><th>Avg</th><th>Mark</th><th>Lev</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</body></html>"""
+
+@app.get("/port2_ssr.html", response_class=HTMLResponse)
+def port_ssr():
+    payload = blofin_latest()
+    return HTMLResponse(_render_port_html(payload))
+# ------------- end SSR --------------
+
+# ---- optional Blofin pull-through (kept) ----
 def _iso_ts() -> str:
     return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\
         .isoformat(timespec="milliseconds").replace("+00:00","Z")
@@ -225,22 +258,17 @@ def _blofin_headers(method: str, path: str, body: str = "") -> Dict[str, str]:
     }
 
 def _blofin_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not path.startswith("/"): 
-        path = "/" + path
+    if not path.startswith("/"): path = "/" + path
     url = f"{BLOFIN_BASE_URL}{path}"
     headers = _blofin_headers("GET", path, "")
     r = requests.get(url, headers=headers, params=params, timeout=20)
-    try: 
-        j = r.json()
-    except Exception: 
-        j = {"raw": r.text}
+    try: j = r.json()
+    except Exception: j = {"raw": r.text}
     return {"status": r.status_code, "json": j}
 
 @app.get("/blofin/balances")
-def blofin_balances():  
-    return _blofin_get(BLOFIN_BALANCES_PATH)
+def blofin_balances():  return _blofin_get(BLOFIN_BALANCES_PATH)
 
 @app.get("/blofin/positions")
-def blofin_positions(): 
-    return _blofin_get(BLOFIN_POSITIONS_PATH)
+def blofin_positions(): return _blofin_get(BLOFIN_POSITIONS_PATH)
 
