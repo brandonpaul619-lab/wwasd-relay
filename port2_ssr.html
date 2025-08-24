@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WWASD — Port (SSR)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#0b0f14; --fg:#e7ecef; --muted:#7b8794; --ok:#3bd671; --warn:#ffcc66; --bad:#ff6b6b; --card:#111820; }
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:14px/1.4 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{max-width:1200px;margin:32px auto;padding:0 16px}
+    h1{font-size:18px;margin:0 0 12px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    .chip{background:var(--card);border:1px solid #1b2632;border-radius:8px;padding:8px 10px}
+    .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+    table{width:100%;border-collapse:collapse;margin-top:12px;background:var(--card);border:1px solid #1b2632;border-radius:10px;overflow:hidden}
+    th,td{padding:10px 12px;border-bottom:1px solid #1b2632;text-align:left;white-space:nowrap}
+    th{color:#a9b4bf;font-weight:600;background:#0f151d;position:sticky;top:0}
+    tr:last-child td{border-bottom:0}
+    .muted{color:var(--muted)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .right{text-align:right}
+    a{color:#8ab4ff;text-decoration:none}
+    .thin{font-weight:400}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WWASD — Port (SSR)</h1>
+  <div id="meta" class="row">
+    <div class="chip">Relay: <span id="relay" class="mono"></span></div>
+    <div class="chip">Token passed: <span id="tok" class="mono"></span></div>
+    <div class="chip">Snapshot: <span id="fresh"></span> <span id="ago" class="muted"></span></div>
+    <div class="chip">PST: <span id="pst" class="mono"></span></div>
+  </div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Side</th>
+        <th class="right">Size</th>
+        <th class="right">Avg Px</th>
+        <th class="right">Mark Px</th>
+        <th class="right">Lev</th>
+      </tr>
+    </thead>
+    <tbody id="body">
+      <tr><td colspan="6" class="muted">Loading…</td></tr>
+    </tbody>
+  </table>
+  <div class="muted" style="margin-top:10px">
+    Source: <code>/blofin/latest</code> (updated by your local pusher every run). This page auto-refreshes every 120s. :contentReference[oaicite:1]{index=1}
+  </div>
+</div>
+
+<script>
+(function(){
+  const qs = new URLSearchParams(location.search);
+  const TOKEN = qs.get('token') || '';  // supports ?token=...
+  const RELAY = location.origin;         // same host as relay service
+
+  const els = {
+    relay: document.getElementById('relay'),
+    tok: document.getElementById('tok'),
+    fresh: document.getElementById('fresh'),
+    ago: document.getElementById('ago'),
+    pst: document.getElementById('pst'),
+    body: document.getElementById('body'),
+  };
+  els.relay.textContent = RELAY.replace(/^https?:\/\//,'');
+  els.tok.textContent = TOKEN ? 'yes' : 'no';
+
+  function fmtPST(tsMs){
+    try { return new Date(tsMs).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }); }
+    catch { return new Date(tsMs).toLocaleString(); }
+  }
+  function age(ms){
+    const s = Math.max(0, Math.round(ms/1000));
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s/60), r = s%60;
+    return `${m}m ${r}s ago`;
+  }
+  function clean(x){ return (x===undefined || x===null) ? '' : String(x); }
+
+  function pick(o, names){
+    for (const n of names){ if (o && Object.prototype.hasOwnProperty.call(o,n) && o[n]) return o[n]; }
+    return '';
+  }
+
+  async function load(){
+    const url = TOKEN ? `${RELAY}/blofin/latest?token=${encodeURIComponent(TOKEN)}`
+                      : `${RELAY}/blofin/latest`;
+    const res = await fetch(url, {cache:'no-store'});
+    if (!res.ok){ throw new Error('HTTP '+res.status); }
+    const j = await res.json();
+
+    // Header/meta
+    els.fresh.innerHTML = j.fresh ? '<span class="ok">fresh</span>' : '<span class="warn">stale</span>';
+    els.ago.textContent = '· ' + age(Date.now() - (j.ts || Date.now()));
+    els.pst.textContent = fmtPST(j.ts || Date.now());
+
+    // Dive to positions array regardless of BloFin envelope
+    const node = j.data && j.data.data ? j.data.data : (j.data || {});
+    let rows = node.positions || node.list || node.data || [];
+    if (!Array.isArray(rows) && typeof rows === 'object'){
+      // sometimes BloFin wraps deeper
+      rows = rows.data || rows.items || rows;
+    }
+    if (!Array.isArray(rows)){ rows = []; }
+
+    // Render
+    if (!rows.length){
+      els.body.innerHTML = '<tr><td colspan="6" class="muted">No open positions.</td></tr>';
+      return;
+    }
+    const out = [];
+    for (const p of rows){
+      const sym  = pick(p, ['instId','symbol']);
+      const side = pick(p, ['posSide','side','direction']);
+      const size = pick(p, ['pos','size','holdVol','availPos']);
+      const avg  = pick(p, ['avgPx','avgPrice','entryPrice']);
+      const mark = pick(p, ['markPx','markPrice','last']);
+      const lev  = pick(p, ['lever','leverage']);
+      out.push(`<tr>
+        <td class="mono">${clean(sym)}</td>
+        <td>${clean(side)}</td>
+        <td class="right mono">${clean(size)}</td>
+        <td class="right mono">${clean(avg)}</td>
+        <td class="right mono">${clean(mark)}</td>
+        <td class="right mono">${clean(lev)}</td>
+      </tr>`);
+    }
+    els.body.innerHTML = out.join('');
+  }
+
+  function tick(){
+    load().catch(e=>{
+      els.body.innerHTML = `<tr><td colspan="6" class="bad">Error: ${e.message}</td></tr>`;
+    });
+  }
+  tick();
+  setInterval(tick, 120000); // 2 minutes, same cadence we’ve always used
+})();
+</script>
+</body>
+</html>
