@@ -49,7 +49,7 @@
     </tbody>
   </table>
   <div class="muted" style="margin-top:10px">
-    Source: <code>/blofin/latest</code> (updated by your local pusher every run). This page auto-refreshes every 120s. :contentReference[oaicite:1]{index=1}
+    Source: <code>/blofin/latest</code> (updated by your local pusher). This page auto‑refreshes every 120s.
   </div>
 </div>
 
@@ -57,7 +57,7 @@
 (function(){
   const qs = new URLSearchParams(location.search);
   const TOKEN = qs.get('token') || '';  // supports ?token=...
-  const RELAY = location.origin;         // same host as relay service
+  const RELAY = location.origin;        // same host as relay service
 
   const els = {
     relay: document.getElementById('relay'),
@@ -81,7 +81,6 @@
     return `${m}m ${r}s ago`;
   }
   function clean(x){ return (x===undefined || x===null) ? '' : String(x); }
-
   function pick(o, names){
     for (const n of names){ if (o && Object.prototype.hasOwnProperty.call(o,n) && o[n]) return o[n]; }
     return '';
@@ -144,3 +143,4 @@
 </script>
 </body>
 </html>
+
