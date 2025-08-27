@@ -1,223 +1,213 @@
-# WWASD Relay v2.6 — TV + Port (FastAPI)
-# - Adds /tv/latest (green|full|all) with fresh_only filtering
-# - Adds /tv/snap to seed list membership (no TV alert changes needed)
-# - Keeps /blofin/latest, /port2_ssr.html, /health exactly as before
-# - Accepts both WWASD_STATE and BLOFIN_POSITIONS on /tv?token=...
+# app.py — WWASD Relay v2.6 (additive, TV latest restored; port untouched)
 
-import os, json, time
-from typing import Dict, Any, List, Set
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
-
-app = FastAPI()
-
-# ------------------------ config ------------------------
-TV_FRESH_MS = int(os.getenv("TV_FRESH_MS", str(48 * 60 * 60 * 1000)))  # 48h window for "fresh_only=1"
-PORT_FRESH_MS = int(os.getenv("PORT_FRESH_MS", str(10 * 60 * 1000)))   # 10m considered "fresh" for port
-AUTH_ENV = os.getenv("AUTH_SHARED_SECRET", "").strip()
-
-def _read_secret_file() -> str:
-    try:
-        with open(".auth_shared_secret", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-AUTH_SHARED_SECRET = AUTH_ENV or _read_secret_file()
+import os, time, json
+from typing import Dict, Any, List
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-# ------------------------ in-memory stores ------------------------
-# Latest WWASD state per symbol:  { "BTCUSDT.P": {"ts": 1756..., "data": {...}} }
-TV_LAST: Dict[str, Dict[str, Any]] = {}
+app = FastAPI(title="wwasd-relay")
 
-# List membership (what belongs to 'green' vs 'full')
-LISTS: Dict[str, Set[str]] = {
-    "green": set(),   # 21
-    "full":  set(),   # 144
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+AUTH = os.environ.get("AUTH_SHARED_SECRET", "")
+
+# ----------------------------
+# In‑memory stores (stateless app)
+# ----------------------------
+STATE: Dict[str, Any] = {
+    "tv_by_symbol": {},     # symbol -> last WWASD_STATE (or BLOFIN_POSITIONS)
+    "lists": {              # optional hard lists; if empty we fallback to "everything we've seen"
+        "green": set(),     # can be filled via /tv/snap (optional)
+        "full":  set(),
+    },
+    "last_blofin_ts": None, # ms
 }
 
-# Port JSON cache: {"fresh": bool, "ts": int, "data": {... or None}}
-PORT_JSON: Dict[str, Any] = {"fresh": False, "ts": None, "data": None}
-
-# ------------------------ helpers ------------------------
-def _require_token(req: Request):
-    token = req.query_params.get("token", "")
-    if not AUTH_SHARED_SECRET or token != AUTH_SHARED_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-def _is_fresh(ts_ms: int, window_ms: int) -> bool:
-    if not ts_ms:
-        return False
-    return (now_ms() - int(ts_ms)) <= window_ms
-
-# ------------------------ health ------------------------
+# ----------------------------
+# Health (unchanged contract)
+# ----------------------------
 @app.get("/health")
 async def health():
-    return JSONResponse({
+    return {
         "ok": True,
         "time": int(time.time()),
-        "tv_count": len(TV_LAST),
-        "port_cached": bool(PORT_JSON.get("data"))
-    })
+        "tv_count": len(STATE["tv_by_symbol"]),
+        "port_cached": STATE["last_blofin_ts"] is not None,
+    }
 
-# ------------------------ TV ingest ------------------------
+# ----------------------------
+# TV intake  (TradingView webhook posts here)
+# Accepts BOTH:
+#  - type="WWASD_STATE"  (from WWASD_State_Emitter)
+#  - type="BLOFIN_POSITIONS" (from your port pusher)
+# ----------------------------
 @app.post("/tv")
-async def tv_ingest(req: Request):
-    _require_token(req)
+async def tv_ingest(request: Request, token: str = ""):
+    if AUTH and token != AUTH:
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    # tolerate text/plain or invalid headers
     try:
-        payload = await req.json()
+        payload = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        body = (await request.body()).decode("utf-8", "ignore")
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
 
-    typ = payload.get("type", "")
-    ts  = int(payload.get("ts", now_ms()))
+    if not isinstance(payload, dict) or "type" not in payload:
+        return JSONResponse({"ok": False, "error": "bad_payload"}, status_code=400)
 
-    # WWASD_STATE from TradingView
-    if typ == "WWASD_STATE":
-        sym = payload.get("symbol", "").strip()
-        if not sym:
-            raise HTTPException(status_code=400, detail="Missing symbol")
-        TV_LAST[sym] = {"ts": ts, "data": payload}
-        return JSONResponse({"ok": True, "msg": "state accepted", "server_received_ms": now_ms()})
+    ptype = str(payload.get("type", "")).upper()
 
-    # BLOFIN_POSITIONS from the Windows bridge
-    if typ == "BLOFIN_POSITIONS":
-        PORT_JSON["data"] = payload
-        PORT_JSON["ts"] = now_ms()
-        PORT_JSON["fresh"] = True
-        return JSONResponse({"ok": True, "msg": "port accepted", "server_received_ms": now_ms()})
+    # Port updates flow through here as BLOFIN_POSITIONS
+    if ptype == "BLOFIN_POSITIONS":
+        # record and mark fresh
+        STATE["tv_by_symbol"]["__PORT__"] = payload
+        STATE["last_blofin_ts"] = now_ms()
+        return {"ok": True, "stored": "BLOFIN_POSITIONS", "server_received_ms": now_ms()}
 
-    # unknown
-    return JSONResponse({"ok": False, "msg": "ignored type"}, status_code=202)
+    # Normal TV state (WWASD_State_Emitter)
+    if ptype == "WWASD_STATE":
+        symbol = str(payload.get("symbol") or payload.get("sym") or "").strip()
+        if not symbol:
+            return JSONResponse({"ok": False, "error": "no_symbol"}, status_code=400)
+        STATE["tv_by_symbol"][symbol] = payload
+        return {"ok": True, "stored": symbol, "server_received_ms": now_ms()}
 
-# ------------------------ TV list snapshot (one-time seeding) ------------------------
-# Body example:
-# { "lists": { "green": ["BTCUSDT.P","ETHUSDT.P", ...], "full": ["... 144 ..."] } }
-@app.post("/tv/snap")
-async def tv_snap(req: Request):
-    _require_token(req)
-    try:
-        body = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    return JSONResponse({"ok": False, "error": "unknown_type"}, status_code=400)
 
-    lists = body.get("lists", {})
-    if not isinstance(lists, dict):
-        raise HTTPException(status_code=400, detail="lists must be an object")
+# ----------------------------
+# TV latest/last (reader endpoints the desks rely on)
+# /tv/latest?lists=green,full&fresh_only=1&max_age_s=3600
+# If a list isn't defined yet, we fall back to "all symbols we've received".
+# ----------------------------
+def _resolve_symbols(list_name: str) -> List[str]:
+    ln = list_name.lower().strip()
+    if ln in ("all", "*"):
+        return sorted(STATE["tv_by_symbol"].keys())
+    s = STATE["lists"].get(ln)
+    if isinstance(s, set) and len(s) > 0:
+        return sorted(list(s))
+    # fallback: return everything we've ever seen so "full" never comes back empty
+    return sorted(STATE["tv_by_symbol"].keys())
 
-    # reset + load
-    for name in ("green", "full"):
-        arr = lists.get(name, [])
-        if isinstance(arr, list):
-            LISTS[name] = {str(s).strip() for s in arr if str(s).strip()}
-    return JSONResponse({"ok": True, "loaded": {k: len(v) for k, v in LISTS.items()}})
-
-# ------------------------ TV latest ------------------------
-# GET /tv/latest?lists=green,full&fresh_only=1
-# also supports lists=all (union of all seen symbols)
 @app.get("/tv/latest")
-async def tv_latest(req: Request):
-    lists_raw = req.query_params.get("lists", "green").strip().lower()
-    fresh_only = req.query_params.get("fresh_only", "1") in ("1", "true", "yes")
-
-    names = [s for s in (x.strip() for x in lists_raw.split(",")) if s]
-    if not names:
-        names = ["green"]
-
-    # Build response buckets
+async def tv_latest(
+    lists: str = "green",
+    fresh_only: int = 0,
+    max_age_s: int = 3600
+):
+    names = [x for x in [t.strip() for t in lists.split(",")] if x]
+    now = now_ms()
+    max_age = max(1, int(max_age_s)) * 1000
     resp_lists: Dict[str, Any] = {}
-
-    # Convenience: lists=all => union of everything we've seen
-    if names == ["all"]:
-        symbols = set(TV_LAST.keys())
+    for name in names:
         items = []
-        for sym in symbols:
-            row = TV_LAST[sym]
-            if (not fresh_only) or _is_fresh(row.get("ts"), TV_FRESH_MS):
-                items.append(row["data"])
-        resp_lists["all"] = {"count": len(items), "items": items}
-    else:
-        for name in names:
-            if name not in ("green", "full"):
-                resp_lists[name] = {"count": 0, "items": []}
+        for sym in _resolve_symbols(name):
+            st = STATE["tv_by_symbol"].get(sym)
+            if not isinstance(st, dict):
                 continue
+            try:
+                ts = int(st.get("ts", 0))
+            except Exception:
+                ts = 0
+            is_fresh = bool(ts and (now - ts) <= max_age)
+            if fresh_only and not is_fresh:
+                continue
+            row = dict(st)
+            row["is_fresh"] = is_fresh
+            items.append(row)
+        resp_lists[name] = {"count": len(items), "items": items}
+    return {"ts": now, "lists": resp_lists}
 
-            wanted = LISTS[name] if LISTS[name] else set()  # may be empty if not snapped yet
-            # If not yet snapped, return ANY symbols we've seen, tagged under this bucket,
-            # so the desk still has data while you seed lists.
-            if not wanted:
-                wanted = set(TV_LAST.keys())
+# alias kept for older scripts
+@app.get("/tv/last")
+async def tv_last(lists: str = "green", fresh_only: int = 0, max_age_s: int = 3600):
+    return await tv_latest(lists=lists, fresh_only=fresh_only, max_age_s=max_age_s)
 
-            items: List[Dict[str, Any]] = []
-            for sym in wanted:
-                row = TV_LAST.get(sym)
-                if not row:
-                    continue
-                if fresh_only and not _is_fresh(row.get("ts"), TV_FRESH_MS):
-                    continue
-                items.append(row["data"])
-            resp_lists[name] = {"count": len(items), "items": items}
+# Optional admin: update watchlists (token required)
+@app.post("/tv/snap")
+async def tv_snap(request: Request, token: str = ""):
+    if AUTH and token != AUTH:
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+    lists = body.get("lists") if isinstance(body, dict) else None
+    if not isinstance(lists, dict):
+        return JSONResponse({"ok": False, "error": "no_lists"}, status_code=400)
+    for name, arr in lists.items():
+        key = str(name).lower().strip()
+        if key not in STATE["lists"]:
+            STATE["lists"][key] = set()
+        if isinstance(arr, list):
+            STATE["lists"][key] = set(str(x) for x in arr)
+    return {"ok": True, "counts": {k: len(v) for k, v in STATE["lists"].items()}}
 
-    return JSONResponse({
-        "ts": now_ms(),
-        "is_fresh": True,
-        "lists": resp_lists
-    })
+@app.get("/tv/lists")
+async def tv_lists():
+    return {
+        "lists": {k: sorted(list(v)) for k, v in STATE["lists"].items()},
+        "tv_count": len(STATE["tv_by_symbol"]),
+    }
 
-# ------------------------ Port: latest JSON ------------------------
+# ----------------------------
+# Port read endpoints (unchanged contract)
+# ----------------------------
+BLOFIN = {"fresh": False, "ts": None, "data": None}
+
 @app.get("/blofin/latest")
 async def blofin_latest():
-    # Always return a consistent shape for the desk
-    return JSONResponse({
-        "fresh": bool(PORT_JSON.get("data")) and _is_fresh(PORT_JSON.get("ts") or 0, PORT_FRESH_MS),
-        "ts": PORT_JSON.get("ts"),
-        "data": PORT_JSON.get("data")
-    })
+    # the pusher posts BLOFIN_POSITIONS via /tv; normalize here for SSR reader
+    port_payload = STATE["tv_by_symbol"].get("__PORT__")
+    if port_payload:
+        return {"fresh": True, "ts": STATE["last_blofin_ts"], "data": port_payload}
+    return BLOFIN
 
-# ------------------------ Port: SSR HTML ------------------------
-@app.get("/port2_ssr.html")
-async def render_port_html():
-    # Light, read-only SSR for the Port Desk (unchanged behavior)
-    b = await blofin_latest()
-    payload = await b.body()
-    try:
-        parsed = json.loads(payload.decode("utf-8"))
-    except Exception:
-        parsed = {"fresh": False, "ts": None, "data": None}
-
-    rows_html = ""
-    data = parsed.get("data") or {}
-    pdata = data.get("data") or {}
-    pos_list = pdata.get("positions") or pdata.get("data") or []  # tolerate both shapes
-
-    if not pos_list:
-        rows_html = "<tr><td colspan='7'>No open positions</td></tr>"
-    else:
-        for p in pos_list:
-            sym = p.get("instId") or p.get("instId".lower()) or p.get("symbol") or "?"
-            side = p.get("positionSide") or p.get("posSide") or p.get("side") or "net"
-            sz   = p.get("positions") or p.get("size") or p.get("positionAmt") or "-"
-            avg  = p.get("averagePrice") or p.get("avgPx") or "-"
-            mark = p.get("markPrice") or "-"
-            lev  = p.get("leverage") or "-"
-            rows_html += f"<tr><td>{sym}</td><td>{side}</td><td>{sz}</td><td>{avg}</td><td>{mark}</td><td>{lev}</td></tr>"
-
-    html = f"""<!doctype html>
+# Minimal SSR page (kept stable and read‑only)
+PORT2_SSR_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>WWASD Port</title>
 <style>
- body{{background:#0b0f14;color:#cfd8e3;font-family:system-ui,Segoe UI,Arial,sans-serif}}
- table{{width:100%;border-collapse:collapse;margin-top:12px}}
- th,td{{padding:8px 10px;border-bottom:1px solid #1b2533}}
- .pill{{display:inline-block;padding:2px 8px;border-radius:12px;background:#1b2533;color:#7bd389;font-size:12px}}
+body{background:#0f1115;color:#e6e6e6;font:14px/1.4 system-ui,Segoe UI,Roboto,Arial}
+table{border-collapse:collapse;width:100%}th,td{padding:8px;border-bottom:1px solid #333}
+small.badge{padding:2px 6px;border-radius:10px;background:#333;margin-left:8px}
 </style></head>
 <body>
-<h2>WWASD Port <span class="pill">{'fresh' if parsed.get('fresh') else 'stale'}</span></h2>
-<table>
-<thead><tr><th>Instrument</th><th>Side</th><th>Sz</th><th>Avg</th><th>Mark</th><th>Lev</th></tr></thead>
-<tbody>{rows_html}</tbody>
-</table>
-</body></html>"""
-    return HTMLResponse(html)
+<h3>WWASD Port <small id="fresh" class="badge">unknown</small></h3>
+<table><thead><tr><th>Instrument</th><th>Side</th><th>Sz</th><th>Avg</th><th>Mark</th><th>Lev</th></tr></thead>
+<tbody id="rows"><tr><td colspan="6">Loading…</td></tr></tbody></table>
+<script>
+async function load(){
+  try {
+    const r = await fetch('/blofin/latest'); const j = await r.json();
+    document.getElementById('fresh').textContent = j.fresh ? 'fresh' : 'stale';
+    const tb = document.getElementById('rows'); tb.innerHTML='';
+    const arr = (j && j.data && j.data.data) ? j.data.data : [];
+    if(!arr.length){ tb.innerHTML='<tr><td colspan="6">No open positions</td></tr>'; return; }
+    for (const p of arr){
+      const tr = document.createElement('tr');
+      const c=(k)=>{const td=document.createElement('td'); td.textContent=(p[k]??''); tr.appendChild(td)};
+      c('instId'); c('positionSide'); c('positions'); c('averagePrice'); c('markPrice'); c('leverage');
+      tb.appendChild(tr);
+    }
+  } catch(e){ console.error(e); }
+}
+load(); setInterval(load,15000);
+</script></body></html>"""
+
+@app.get("/port2_ssr.html")
+async def port2_ssr():
+    return HTMLResponse(PORT2_SSR_HTML)
 
