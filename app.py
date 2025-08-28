@@ -1,4 +1,4 @@
-# app.py — WWASD Relay v2.9 (adds /snap.json)
+# app.py — WWASD Relay v2.7 (adds /snap.json)
 # - TV: /tv ingest (WWASD_STATE) → /snap, /tv/latest (+ SSR mirror)
 # - Port: /tv ingest (BLOFIN_POSITIONS) with disk backup → /blofin/latest → /port2_ssr.html /port2.html
 # - Adds /snap.json endpoint to serve snap data as plain JSON
@@ -259,9 +259,22 @@ def snap_raw_html(lists: str = "green,macro,full", fresh_only: int = 1, max_age_
     <pre> element so it can be viewed and copied from a normal browser.
     """
     payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
-    json_str = json.dumps(payload)
+    # Pretty-print the JSON with indentation to ensure line breaks for sandbox viewers
+    json_str = json.dumps(payload, indent=2)
     escaped  = html.escape(json_str)
     return HTMLResponse(f"<pre>{escaped}</pre>", headers={"Cache-Control": "no-store"})
+
+# ---------- Plain-text snapshot (for environments that can’t render HTML or JSON) ----------
+@app.get("/snap_plain.txt")
+def snap_plain_txt(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """
+    Return the snap JSON as indented plain text.  Some sandboxed browsers won’t
+    display JSON or HTML properly, but they will display a text/plain response.
+    The indentation makes it readable and parsable.
+    """
+    payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    pretty  = json.dumps(payload, indent=2)
+    return PlainTextResponse(pretty, media_type="text/plain")
 
 # ---------- Port JSON ----------
 @app.get("/blofin/latest")
@@ -384,4 +397,3 @@ async function load(){
 load(); setInterval(load, 12000);
 </script></body></html>"""
     return HTMLResponse(html_doc, headers={"Cache-Control":"no-store"})
-
