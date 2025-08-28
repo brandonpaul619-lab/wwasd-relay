@@ -188,7 +188,8 @@ async def tv_latest(lists: str = "green,macro,full", fresh_only: int = 1, max_ag
 
 @app.get("/snap")
 async def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = TV_FRESH_SECS):
-    return await tv_latest(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    resp = await tv_latest(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+        re turn resp
 
 # -------------------- Port JSON (bot‑safe, clean) --------------------
 @app.get("/blofin/latest")
