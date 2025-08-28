@@ -12,7 +12,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---------- Utils ----------
 def now_ms() -> int: return int(time.time() * 1000)
-def _strip(s: str) -> str: return (s or "").strip().strip('"\' ).strip()
+def _strip(s: str) -> str:
+    """Normalize a string by stripping whitespace and surrounding quotes."""
+    # Start with a safe default string and remove outer whitespace
+    s = (s or "").strip()
+    # Remove a single leading and trailing double quote
+    if s.startswith("\"") and s.endswith("\""):
+        s = s[1:-1]
+    # Remove a single leading and trailing single quote
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1]
+    # Return the result with any additional whitespace trimmed
+    return s.strip()
 def _upper(s: str) -> str: return _strip(s).upper()
 
 def _split_env_list(name: str) -> List[str]:
