@@ -1,6 +1,7 @@
-# app.py — WWASD Relay v2.6 (final)
+# app.py — WWASD Relay v2.7 (adds /snap.json)
 # - TV: /tv ingest (WWASD_STATE) → /snap, /tv/latest (+ SSR mirror)
 # - Port: /tv ingest (BLOFIN_POSITIONS) with disk backup → /blofin/latest → /port2_ssr.html /port2.html
+# - Adds /snap.json endpoint to serve snap data as plain JSON
 # - Single worker; no static HTML files named port*.html in repo.
 
 import os, time, json, html, datetime, threading
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---------- Utils ----------
 def now_ms() -> int: return int(time.time() * 1000)
-def _strip(s: str) -> str: return (s or "").strip().strip('"\'' ).strip()
+def _strip(s: str) -> str: return (s or "").strip().strip('"\' ).strip()
 def _upper(s: str) -> str: return _strip(s).upper()
 
 def _split_env_list(name: str) -> List[str]:
@@ -125,6 +126,7 @@ def root():
         "GET  /blofin/latest  (Port JSON)\n"
         "GET  /port2_ssr.html (Port SSR)\n"
         "GET  /port2.html     (Port live view)\n"
+        "GET  /snap.json      (TV JSON for restricted clients)\n"
         "GET  /health         (ok,tv_count,port_cached)\n"
     )
 
@@ -216,12 +218,17 @@ def snap_ssr(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs:
             f"<tbody>{rows}</tbody></table>"
         )
     html_doc = (
-        "<!doctype html><meta charset='utf-8'/>"
-        "<title>WWASD Snap</title>"
+        "<!doctype html><meta charset='utf-8'/><title>WWASD Snap</title>"
         "<body style='background:#0b0f14;color:#e6edf3;font:14px system-ui;padding:16px'>"
         + "".join(parts) + "</body>"
     )
     return HTMLResponse(html_doc, headers={"Cache-Control": "no-store"})
+
+# ---------- New plain JSON endpoint ----------
+@app.get("/snap.json")
+def snap_json(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """Return the snap JSON for simpler consumption by bots."""
+    return JSONResponse(snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs))
 
 # ---------- Port JSON ----------
 @app.get("/blofin/latest")
@@ -248,6 +255,7 @@ def blofin_latest():
     }
 
 # ---------- Port SSR ----------
+
 def _fmt(v: Any) -> str: return html.escape(str(v)) if v is not None else ""
 
 def _render_port_html(latest: Optional[Dict[str, Any]]) -> str:
