@@ -1,4 +1,4 @@
-# app.py — WWASD Relay v2.7 (adds /snap.json)
+# app.py — WWASD Relay v2.9 (adds /snap.json)
 # - TV: /tv ingest (WWASD_STATE) → /snap, /tv/latest (+ SSR mirror)
 # - Port: /tv ingest (BLOFIN_POSITIONS) with disk backup → /blofin/latest → /port2_ssr.html /port2.html
 # - Adds /snap.json endpoint to serve snap data as plain JSON
@@ -384,3 +384,4 @@ async function load(){
 load(); setInterval(load, 12000);
 </script></body></html>"""
     return HTMLResponse(html_doc, headers={"Cache-Control":"no-store"})
+
