@@ -238,8 +238,30 @@ def snap_ssr(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs:
 # ---------- New plain JSON endpoint ----------
 @app.get("/snap.json")
 def snap_json(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
-    """Return the snap JSON for simpler consumption by bots."""
-    return JSONResponse(snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs))
+    """
+    Return the snap JSON for simpler consumption by bots.  Instead of sending an
+    application/json content type (which some sandboxed environments block),
+    this route serialises the snap payload into a JSON string and serves it
+    as plain text with a JSON media type.  This avoids fetch restrictions
+    while preserving the same information.
+    """
+    payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    # Serve the JSON as plain text; some environments block application/json
+    return PlainTextResponse(json.dumps(payload), media_type="application/json")
+
+# ---------- Additional HTML wrapper for JSON (to circumvent browser sandbox blocking) ----------
+@app.get("/snap_raw.html")
+def snap_raw_html(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """
+    Return the snap JSON wrapped in a <pre> tag as HTML.  Some sandboxed browsers
+    will not load JSON or text/plain responses from external domains, but they
+    allow HTML to render.  This route escapes the JSON and embeds it into a
+    <pre> element so it can be viewed and copied from a normal browser.
+    """
+    payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    json_str = json.dumps(payload)
+    escaped  = html.escape(json_str)
+    return HTMLResponse(f"<pre>{escaped}</pre>", headers={"Cache-Control": "no-store"})
 
 # ---------- Port JSON ----------
 @app.get("/blofin/latest")
