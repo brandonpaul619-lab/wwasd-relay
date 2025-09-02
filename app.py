@@ -47,6 +47,8 @@ AUTH_SHARED_SECRET = _strip(os.getenv("AUTH_SHARED_SECRET",""))
 FRESH_CUTOFF_SECS  = int(os.getenv("FRESH_CUTOFF_SECS", "5400"))  # TV freshness window (90m default)
 BLOFIN_TTL_SEC     = int(os.getenv("BLOFIN_TTL_SEC", "240"))       # Port freshness (4m)
 BLOFIN_LATEST_PATH = _strip(os.getenv("BLOFIN_LATEST_PATH", "/tmp/blofin_latest.json"))
+TV_LATEST_CACHE_PATH = _strip(os.getenv("TV_LATEST_CACHE_PATH", "/tmp/tv_latest.json"))
+
 
 GREEN_LIST = _split_env_list("GREEN_LIST")
 MACRO_LIST = _split_env_list("MACRO_LIST")
@@ -397,3 +399,148 @@ async function load(){
 load(); setInterval(load, 12000);
 </script></body></html>"""
     return HTMLResponse(html_doc, headers={"Cache-Control":"no-store"})
+# ──────────────────────────────────────────────────────────────────────────────
+# ADD: Tiny TV disk cache + CSV/HTML snapshot endpoints (append‑only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Safe atomic write of the in‑memory TV snapshot to disk
+def _tv_write_atomic(obj: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        path = TV_LATEST_CACHE_PATH
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            # Store a minimal object we can re‑hydrate from
+            json.dump({"items": obj, "ts": now_ms()}, f, separators=(",", ":"), ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        # Non‑fatal; in‑memory state still used
+        pass
+
+# Load the last snapshot if it exists (pre‑warm after cold start)
+def _tv_load_last() -> Optional[Dict[str, Dict[str, Any]]]:
+    try:
+        path = TV_LATEST_CACHE_PATH
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items")
+        return items if isinstance(items, dict) else None
+    except Exception:
+        return None
+
+# Pre‑warm _tv_latest at boot (no route changes)
+try:
+    _pre = _tv_load_last()
+    if _pre:
+        _tv_latest.update(_pre)
+except Exception:
+    pass
+
+# Background saver: write snapshot every ~10s so /snap* never starts empty
+def _tv_saver_loop():
+    while True:
+        time.sleep(10)
+        try:
+            _tv_write_atomic(_tv_latest)
+        except Exception:
+            pass
+
+try:
+    # Start once; daemon thread so it won't block shutdown
+    _tv_saver_thr_started  # type: ignore[name-defined]
+except NameError:
+    _tv_saver_thr_started = True
+    threading.Thread(target=_tv_saver_loop, daemon=True).start()
+
+# Helper to flatten snap() into rows for CSV/HTML
+def _rows_from_snap(snap_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    lists_obj = snap_json.get("lists", {}) or {}
+    for _, pack in lists_obj.items():
+        for it in pack.get("items", []) or []:
+            sym = it.get("symbol", "")
+            if sym in seen:
+                continue
+            seen.add(sym)
+            oneD = (it.get("mtf") or {}).get("1D") or {}
+            htf  = it.get("htf") or {}
+            rows.append({
+                "symbol": sym,
+                "cmp": it.get("cmp"),
+                "ema12_state": oneD.get("ema12_state"),
+                "qvwap_state": oneD.get("qvwap_state") or oneD.get("qv_state"),
+                "hh": oneD.get("hh"),
+                "hl": oneD.get("hl"),
+                "lh": oneD.get("lh"),
+                "ll": oneD.get("ll"),
+                "rsi": oneD.get("rsi", it.get("rsi")),
+                "is_fresh": it.get("is_fresh"),
+                "htf_sig": htf.get("sig"),
+                "htf_rating": htf.get("rating"),
+            })
+    return rows
+    
+# CSV snapshot (desk‑friendly)
+@app.get("/snap.csv")
+def snap_csv(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    rows = _rows_from_snap(payload)
+    cols = ["symbol","cmp","ema12_state","qvwap_state","hh","hl","lh","ll","rsi","is_fresh","htf_sig","htf_rating"]
+
+    def _fmt(v: Any) -> str:
+        if isinstance(v, bool): return "true" if v else "false"
+        if v is None: return ""
+        s = str(v)
+        if any(c in s for c in [",", "\"", "\n"]):
+            s = s.replace("\"", "\"\"")
+            s = f"\"{s}\""
+        return s
+
+    lines = [",".join(cols)]
+    for r in rows:
+        lines.append(",".join(_fmt(r.get(c)) for c in cols))
+    body = "\n".join(lines)
+    return PlainTextResponse(body, media_type="text/csv", headers={"Cache-Control": "no-store"})
+
+# Simple HTML table snapshot (for sandboxes that can’t parse JSON)
+@app.get("/snap_table.html")
+def snap_table_html(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
+    payload = snap(lists=lists, fresh_only=fresh_only, max_age_secs=max_age_secs)
+    rows = _rows_from_snap(payload)
+    head = f"""<!doctype html><meta charset="utf-8"><title>WWASD Snap Table</title>
+<style>
+ body{{background:#0b0f14;color:#e6edf3;font:14px system-ui;padding:16px}}
+ table{{width:100%;border-collapse:collapse}}
+ th,td{{border-bottom:1px solid #1f2937;padding:6px 5px;text-align:left}}
+ th{{color:#a9b0bc;font-weight:600}}
+ .good{{color:#34d399}} .bad{{color:#f87171}} .muted{{color:#94a3b8}}
+</style>
+<h1>WWASD Snapshot <span class="muted">(fresh_only={fresh_only})</span></h1>
+<table><thead><tr>
+  <th>Symbol</th><th>CMP</th><th>EMA12</th><th>QVWAP</th><th>HH</th><th>HL</th><th>LH</th><th>LL</th>
+  <th>RSI</th><th>Fresh</th><th>HTF Sig</th><th>HTF Rating</th>
+</tr></thead><tbody>"""
+    def td(v: Any, cls: str = "") -> str:
+        s = html.escape("" if v is None else str(v))
+        c = f' class="{cls}"' if cls else ""
+        return f"<td{c}>{s}</td>"
+
+    body_rows = []
+    for r in rows:
+        fresh_cls = "good" if r.get("is_fresh") else "bad"
+        body_rows.append(
+            "<tr>" +
+            td(r.get("symbol")) + td(r.get("cmp")) + td(r.get("ema12_state")) + td(r.get("qvwap_state")) +
+            td(r.get("hh")) + td(r.get("hl")) + td(r.get("lh")) + td(r.get("ll")) +
+            td(r.get("rsi")) + td("fresh" if r.get("is_fresh") else "stale", fresh_cls) +
+            td(r.get("htf_sig")) + td(r.get("htf_rating")) +
+            "</tr>"
+        )
+    html_doc = head + "\n".join(body_rows) + "</tbody></table>"
+    return HTMLResponse(html_doc, headers={"Cache-Control": "no-store"})
+# ──────────────────────────────────────────────────────────────────────────────
