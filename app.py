@@ -14,22 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 def now_ms() -> int: return int(time.time() * 1000)
 def _strip(s: str) -> str:
     """Normalize a string by stripping whitespace and surrounding quotes."""
-    # Start with a safe default string and remove outer whitespace
     s = (s or "").strip()
-    # Remove a single leading and trailing double quote
-    if s.startswith("\"") and s.endswith("\""):
+    if s.startswith(("'", '"')) and s.endswith(("'", '"')) and len(s) >= 2:
         s = s[1:-1]
-    # Remove a single leading and trailing single quote
-    if s.startswith("'") and s.endswith("'"):
-        s = s[1:-1]
-    # Return the result with any additional whitespace trimmed
-    return s.strip()
-def _upper(s: str) -> str: return _strip(s).upper()
+    return s
 
-def _split_env_list(name: str) -> List[str]:
-    raw = os.getenv(name, "")
-    raw = raw.replace("\\n", " ").replace("\n", " ")
-    if raw.startswith('"') and raw.endswith('"'): raw = raw[1:-1]
+def _upper(s: Optional[str]) -> str: return (s or "").strip().upper()
+
+def _split_env_list(key: str) -> List[str]:
+    raw = os.getenv(key, "") or ""
+    if not raw: return []
+    # support commas and whitespace
     return [ _upper(t) for t in raw.split(",") if _upper(t) ]
 
 def _norm_variants(sym: str) -> Set[str]:
@@ -76,8 +71,6 @@ def _fresh_ms(ts_ms: Optional[int], max_age_secs: int) -> bool:
 # ---------- Port disk hardening ----------
 def _blofin_write_atomic(obj: Dict[str, Any]) -> None:
     try:
-        d = os.path.dirname(BLOFIN_LATEST_PATH)
-        if d: os.makedirs(d, exist_ok=True)
         tmp = BLOFIN_LATEST_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, separators=(",", ":"), ensure_ascii=False)
@@ -110,33 +103,33 @@ def _extract_positions(any_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
       {"data":[...]} or {"positions":[...]} or {"payload":{...}}
     """
     if not any_payload: return []
-    data = any_payload.get("data")
-    if isinstance(data, dict) and isinstance(data.get("data"), list): return data["data"]
+    data = any_payload.get("data", any_payload)
+    if isinstance(data, dict) and "data" in data: data = data["data"]
+    if isinstance(data, dict) and "positions" in data: data = data["positions"]
     if isinstance(data, list): return data
-    if isinstance(any_payload.get("positions"), list): return any_payload["positions"]
-    inner = any_payload.get("payload")
-    if isinstance(inner, dict): return _extract_positions(inner)
     return []
 
-def _list_selector(name: str) -> Optional[Set[str]]:
-    ln = (name or "").lower()
-    return SEL_GREEN if ln == "green" else SEL_MACRO if ln == "macro" else SEL_FULL if ln == "full" else None
+def _in_named_list(sym: str, name: str) -> bool:
+    sset = SEL_GREEN if name == "green" else SEL_MACRO if name == "macro" else SEL_FULL
+    if not sset: return True
+    norm = _norm_variants(sym)
+    return any(n in sset for n in norm)
 
-def _in_named_list(sym: str, list_name: str) -> bool:
-    sel = _list_selector(list_name)
-    return True if sel is None else bool(_norm_variants(sym) & sel)
+def _dict(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Shallow-copy dict (don’t leak internal refs)."""
+    return dict(item or {})
 
-# ---------- Routes: root / health ----------
+# ---------- Home ----------
 @app.get("/")
-def root():
+def home():
     return PlainTextResponse(
-        "wwasd-relay online\n"
-        "POST /tv?token=***  (WWASD_STATE or BLOFIN_POSITIONS)\n"
-        "GET  /snap?lists=green,macro,full&fresh_only=1  (TV JSON)\n"
-        "GET  /snap_ssr.html  (TV SSR)\n"
-        "GET  /blofin/latest  (Port JSON)\n"
-        "GET  /port2_ssr.html (Port SSR)\n"
-        "GET  /port2.html     (Port live view)\n"
+        "WWASD Relay\n"
+        "POST /tv             (ingest; WWASD_STATE or BLOFIN_POSITIONS)\n"
+        "GET  /tv/latest      (TV collation snapshot)\n"
+        "GET  /snap           (TV collation for lists)\n"
+        "GET  /snap_ssr.html  (SSR list preview)\n"
+        "GET  /snap_raw.html  (HTML-wrapped JSON)\n"
+        "GET  /snap_plain.txt (plain text JSON)\n"
         "GET  /snap.json      (TV JSON for restricted clients)\n"
         "GET  /health         (ok,tv_count,port_cached)\n"
     )
@@ -201,7 +194,8 @@ def _tv_collect(list_name: Optional[str], fresh_only: int, max_age_secs: int) ->
 @app.get("/tv/latest")
 def tv_latest(list: str = "", fresh_only: int = 0, max_age_secs: int = FRESH_CUTOFF_SECS):
     name = (list or "").strip().lower()
-    return _tv_collect(name or None, fresh_only, max_age_secs)
+    payload = _tv_collect(name or None, fresh_only, max_age_secs)
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 @app.get("/snap")
 def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):
@@ -321,13 +315,14 @@ def _render_port_html(latest: Optional[Dict[str, Any]]) -> str:
     pill = '<span style="padding:.15rem .45rem;border-radius:.5rem;font-size:.8rem;background:#2a6c2a;color:#dff0d8">fresh</span>' \
            if fresh else '<span style="padding:.15rem .45rem;border-radius:.5rem;font-size:.8rem;background:#5a5a5a;color:#eee">stale</span>'
     table = rows_html or '<tr><td colspan="6" style="opacity:.6">No open positions</td></tr>'
-    return f"""<!doctype html><html><head><meta charset="utf-8"/><title>WWASD Port</title>
+    return f"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>WWASD Port</title>
 <style>
- body{{background:#0f1115;color:#e6e6e6;font:14px/1.4 system-ui,Segoe UI,Inter,Arial}}
- .wrap{{max-width:980px;margin:24px auto;padding:0 16px}}
- h1{{font-size:18px;margin:0 0 8px}}
- table{{width:100%;border-collapse:collapse;border-spacing:0;margin-top:12px}}
- th,td{{padding:8px 10px;border-bottom:1px solid #222;white-space:nowrap}}
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:24px;background:#0b0f14;color:#e6edf3}}
+ table{{width:100%;border-collapse:collapse;margin-top:12px}}
+ th,td{{border-bottom:1px solid #1f2937;padding:8px;text-align:left;font-size:14px}}
+ .pill{{padding:.15rem .45rem;border-radius:.5rem;font-size:.8rem}}
  th{{text-align:left;color:#a9b0bc;font-weight:600}}
  .sub{{color:#8a92a6;font-size:.9rem}}
 </style>
@@ -358,31 +353,36 @@ def port2_html():
 </style></head><body>
 <div class="row">
   <div id="statusPill" class="pill stale">STALE</div>
-  <div id="age" class="muted"></div>
+  <div class="muted">Server time: <span id="srvts"></span></div>
 </div>
-<div class="muted" id="stamp"></div>
-<div id="upnl" style="margin-top:8px;font-weight:600;"></div>
-<table id="t"><thead><tr>
-<th>Symbol</th><th>Side</th><th>Qty</th><th>Avg</th><th>Mark</th><th>uPnL</th><th>Lev</th>
-</tr></thead><tbody id="tb"></tbody></table>
-<div id="err" class="muted"></div>
+<pre id="err" style="color:#9a3412"></pre>
+<table>
+  <thead><tr><th>Instrument</th><th>Side</th><th>Sz</th><th>Avg</th><th>Mark</th><th>Lev</th></tr></thead>
+  <tbody id="tb"></tbody>
+</table>
+<div class="muted" id="upnl">uPnL (sum): -</div>
 <script>
-const fmt = n => (n==null||isNaN(n))? "" : (+n).toLocaleString(undefined,{maximumFractionDigits:8});
 async function load(){
-  let pill=document.getElementById('statusPill'), tb=document.getElementById('tb'),
-      age=document.getElementById('age'), stamp=document.getElementById('stamp'),
-      upnl=document.getElementById('upnl'), err=document.getElementById('err');
+  const pill = document.getElementById('statusPill');
+  const tb   = document.getElementById('tb');
+  const err  = document.getElementById('err');
+  const upnl = document.getElementById('upnl');
+  const srv  = document.getElementById('srvts');
   try{
-    const r = await fetch('/blofin/latest', {cache:'no-store'}); const o = await r.json();
-    err.textContent=""; pill.textContent = o.fresh ? "FRESH" : "STALE";
-    pill.className = "pill " + (o.fresh ? "fresh" : "stale");
-    stamp.textContent = "server ts: " + (o.ts ?? "—");
-    const data = (o && o.positions) || [];
-    tb.innerHTML=""; let sum=0;
-    for(const p of data){
-      const side = (p.positionSide||p.posSide||p.side||"").toUpperCase();
-      const up = parseFloat(p.unrealizedPnl||0); sum += (isFinite(up)?up:0);
+    const r = await fetch('/blofin/latest', {cache:'no-store'});
+    const j = await r.json();
+    srv.textContent = new Date().toISOString().slice(0,19).replace('T',' ');
+    tb.innerHTML = '';
+    let sum = 0;
+    const fresh = !!j.fresh;
+    pill.textContent = fresh ? 'FRESH' : 'STALE';
+    pill.className = 'pill ' + (fresh ? 'fresh' : 'stale');
+    const fmt = (v)=> (v==null ? '-' : (typeof v==='number' ? v.toFixed(4) : String(v)));
+    for(const p of (j.positions||[])){
       const tr = document.createElement('tr');
+      const side = (p.positionSide||p.posSide||p.side||'net').toUpperCase();
+      const up = Number(p.unrealizedPnl || p.upl || p.uPnL || 0);
+      sum += isFinite(up) ? up : 0;
       tr.innerHTML = `<td>${p.instId||p.symbol||""}</td><td>${side}</td><td>${fmt(p.positions||p.pos||p.size||p.qty)}</td>
                       <td>${fmt(p.averagePrice||p.avg||p.avgPx)}</td><td>${fmt(p.markPrice||p.mark||p.markPx)}</td>
                       <td>${fmt(up)}</td><td>${fmt(p.leverage||p.lever)}</td>`;
