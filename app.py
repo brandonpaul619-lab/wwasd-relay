@@ -1,7 +1,8 @@
-# app.py — WWASD Relay v2.7 (adds /snap.json)
+# app.py — WWASD Relay v2.8 (adds /tv/symbol)
 # - TV: /tv ingest (WWASD_STATE) → /snap, /tv/latest (+ SSR mirror)
 # - Port: /tv ingest (BLOFIN_POSITIONS) with disk backup → /blofin/latest → /port2_ssr.html /port2.html
 # - Adds /snap.json endpoint to serve snap data as plain JSON
+# - Adds /tv/symbol to fetch state for a single symbol
 # - Single worker; no static HTML files named port*.html in repo.
 
 import os, time, json, html, datetime, threading
@@ -198,6 +199,23 @@ def tv_latest(list: str = "", fresh_only: int = 0, max_age_secs: int = FRESH_CUT
     name = (list or "").strip().lower()
     payload = _tv_collect(name or None, fresh_only, max_age_secs)
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+@app.get("/tv/symbol/{symbol}")
+def tv_symbol(symbol: str, max_age_secs: int = FRESH_CUTOFF_SECS):
+    """Return the latest WWASD_STATE for a single symbol."""
+    sym = _upper(symbol)
+    item = _tv_latest.get(sym)
+    if not item:
+        for alt in _norm_variants(sym):
+            item = _tv_latest.get(alt)
+            if item:
+                break
+    if not item:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    out = dict(item)
+    ts = out.get("server_received_ms") or out.get("ts")
+    out["is_fresh"] = _fresh_ms(ts, max_age_secs)
+    return JSONResponse(out, headers={"Cache-Control": "no-store"})
 
 @app.get("/snap")
 def snap(lists: str = "green,macro,full", fresh_only: int = 1, max_age_secs: int = FRESH_CUTOFF_SECS):

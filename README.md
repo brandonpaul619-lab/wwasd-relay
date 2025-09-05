@@ -5,6 +5,7 @@ Drop‑in relay for TradingView alerts. Accepts **JSON** from Pine (`Any alert()
 ## Endpoints
 - `POST /tv` — ingest alerts (JSON or multipart). If `type == "WWASD_STATE"`, it is stored by symbol.
 - `GET /tv/latest?list=green&max_age_secs=5400` — newest state per symbol. Adds `is_fresh` based on `FRESH_CUTOFF_SECS`.
+- `GET /tv/symbol/{symbol}?max_age_secs=5400` — latest state for one symbol with `is_fresh`.
 - `GET /health` — basic status.
 
 ## Env vars
@@ -55,6 +56,8 @@ GET /health — quick ping; confirms the process is alive and can read caches.
 
 TradingView state snapshots
 
+GET /tv/latest?list=green&max_age_secs=5400 — JSON collated state per list.
+GET /tv/symbol/BTCUSDT — latest state for a single symbol.
 GET /snap_raw.html?fresh_only=1&lists=green,full,macro — SSR view you already use.
 
 GET /snap.csv?fresh_only=1&lists=… — flat CSV (works in restricted sandboxes).
