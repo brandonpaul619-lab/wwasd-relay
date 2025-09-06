@@ -203,3 +203,5 @@ The JSON from /blofin/latest.
 The first 20 rows from /snap.csv?fresh_only=1&lists=green,full,macro.
 
 The exact Condition → study name from one active TradingView alert that just fired.
+
+Note: Indicator timeframe toggles and comp.ind fields added; rating math unchanged (v100 parity).

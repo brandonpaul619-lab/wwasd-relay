@@ -1,0 +1,136 @@
+//@version=6
+indicator("WWASD – Risk Regime Radar (BTC.D / OTHERS.D / Stable.D + BTCPX)",
+     shorttitle="WWASD_RISK", overlay=false, timeframe_gaps=true)
+
+// Inputs: set your symbols here. STABLE dominance defaults to USDT.D; change to STABLE.C.D if needed.
+btcPxSym     = input.symbol("BINANCE:BTCUSDT",     "BTC Price Symbol")
+btcDomSym    = input.symbol("CRYPTOCAP:BTC.D",     "BTC Dominance Symbol")
+othersDomSym = input.symbol("CRYPTOCAP:OTHERS.D",  "Alt Dominance (OTHERS.D) Symbol")
+stableDomSym = input.symbol("CRYPTOCAP:USDT.D",    "Stable Dominance Symbol")
+
+// Timeframes for LTF/HTF groups
+ltf1 = input.string("1",   "LTF #1", options=["1","3","5","15","30","60"])
+ltf2 = input.string("15",  "LTF #2", options=["1","3","5","15","30","60"])
+ltf3 = input.string("60",  "LTF #3", options=["15","30","45","60","120"])
+htf1 = input.string("240", "HTF #1 (4H)", options=["120","180","240","360"])
+htf2 = input.string("720", "HTF #2 (12H)", options=["360","720","D"])
+htf3 = input.string("D",   "HTF #3 (1D)",  options=["720","D","2D","3D","W"])
+
+// Trend parameters
+lookbackBars = input.int(20, "Trend Lookback (bars)", minval=5)
+deadzonePct  = input.float(0.20, "Dead‑zone % (noise filter)", step=0.05)
+
+// RSI display (optional; not used for scoring)
+showRSI      = input.bool(true, "Show RSI (display only)")
+rsiLen       = input.int(14, "RSI Length", minval=2)
+rsiOB        = input.int(70, "RSI Overbought", minval=50, maxval=100)
+rsiOS        = input.int(30, "RSI Oversold",  minval=0,  maxval=50)
+
+// --- Helpers ---
+// Percent change over n bars
+pctChange(s, n) =>
+    base = nz(s[n])
+    base == 0.0 ? 0.0 : (s - base) / base * 100.0
+
+// Determine trend state: -1=down, 0=flat, +1=up
+trendState(sym, tf) =>
+    series = request.security(sym, tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+    ch = ta.sma(pctChange(series, lookbackBars), 3)
+    ch >  deadzonePct ?  1 : ch < -deadzonePct ? -1 : 0
+
+// Calculate risk score: positive values favor risk-on; negative risk-off.
+riskScore(btcPxState, btcDomState, othersState, stableState) =>
+    (-1 * btcDomState) + (1 * btcPxState) + (1 * othersState) + (-1 * stableState)
+
+// Map score to regime: +1=risk-on, -1=risk-off, 0=hold
+regimeFromScore(sc) => sc >= 2 ? 1 : sc <= -2 ? -1 : 0
+
+// Majority vote function for three ints (-1/0/1)
+vote3(a, b, c) =>
+    sum = a + b + c
+    sum >= 2 ? 1 : sum <= -2 ? -1 : 0
+
+// Convert regime to label string
+regimeLabel(x) => x > 0 ? "RISK_ON" : x < 0 ? "RISK_OFF" : "HOLD"
+
+// Colour helpers
+colState(x) => x > 0 ? color.lime : x < 0 ? color.red : color.gray
+colRegime(x) => x > 0 ? color.new(color.lime, 80) : x < 0 ? color.new(color.red, 80) : color.new(color.silver, 80)
+
+// --- Evaluate trend states for each timeframe ---
+evalTf(tf) =>
+    btcPx  = trendState(btcPxSym,     tf)
+    btcDom = trendState(btcDomSym,    tf)
+    others = trendState(othersDomSym, tf)
+    stable = trendState(stableDomSym, tf)
+    score  = riskScore(btcPx, btcDom, others, stable)
+    regime = regimeFromScore(score)
+    [btcPx, btcDom, others, stable, score, regime]
+
+// Evaluate LTF and HTF sets
+[px1, dom1, oth1, st1, sc1, rg1] = evalTf(ltf1)
+[px2, dom2, oth2, st2, sc2, rg2] = evalTf(ltf2)
+[px3, dom3, oth3, st3, sc3, rg3] = evalTf(ltf3)
+[px4, dom4, oth4, st4, sc4, rg4] = evalTf(htf1)
+[px5, dom5, oth5, st5, sc5, rg5] = evalTf(htf2)
+[px6, dom6, oth6, st6, sc6, rg6] = evalTf(htf3)
+
+// Aggregate votes and scores
+btcPx_LTF    = vote3(px1, px2, px3)
+btcDom_LTF   = vote3(dom1, dom2, dom3)
+others_LTF   = vote3(oth1, oth2, oth3)
+stable_LTF   = vote3(st1, st2, st3)
+score_LTF    = riskScore(btcPx_LTF, btcDom_LTF, others_LTF, stable_LTF)
+reg_LTF      = regimeFromScore(score_LTF)
+
+btcPx_HTF    = vote3(px4, px5, px6)
+btcDom_HTF   = vote3(dom4, dom5, dom6)
+others_HTF   = vote3(oth4, oth5, oth6)
+stable_HTF   = vote3(st4, st5, st6)
+score_HTF    = riskScore(btcPx_HTF, btcDom_HTF, others_HTF, stable_HTF)
+reg_HTF      = regimeFromScore(score_HTF)
+
+// --- Table rendering ---
+var table t = table.new(position=position.top_right, columns=7, rows=3, border_width=1)
+
+// Render header once
+if barstate.isfirst
+    table.cell(t, 0, 0, "GROUP",    text_color=color.white)
+    table.cell(t, 1, 0, "BTC PX",    text_color=color.white)
+    table.cell(t, 2, 0, "BTC.D",     text_color=color.white)
+    table.cell(t, 3, 0, "OTHERS.D",  text_color=color.white)
+    table.cell(t, 4, 0, "STABLE.D",  text_color=color.white)
+    table.cell(t, 5, 0, "SCORE",     text_color=color.white)
+    table.cell(t, 6, 0, "REGIME",    text_color=color.white)
+
+// Helper to render a row
+renderRow(row, name, sPx, sDom, sOth, sSta, sc, reg) =>
+    table.cell(t, 0, row, name)
+    table.cell(t, 1, row, sPx  == 1 ? "▲" : sPx  == -1 ? "▼" : "–", text_color=colState(sPx))
+    table.cell(t, 2, row, sDom == 1 ? "▲" : sDom == -1 ? "▼" : "–", text_color=colState(sDom))
+    table.cell(t, 3, row, sOth == 1 ? "▲" : sOth == -1 ? "▼" : "–", text_color=colState(sOth))
+    table.cell(t, 4, row, sSta == 1 ? "▲" : sSta == -1 ? "▼" : "–", text_color=colState(sSta))
+    table.cell(t, 5, row, str.tostring(sc), text_color=colState(sc))
+    table.cell(t, 6, row, regimeLabel(reg), text_color=color.white, bgcolor=colRegime(reg))
+
+// Draw LTF and HTF rows each bar
+renderRow(1, "LTF (" + ltf1 + "/" + ltf2 + "/" + ltf3 + ")", btcPx_LTF, btcDom_LTF, others_LTF, stable_LTF, score_LTF, reg_LTF)
+renderRow(2, "HTF (" + htf1 + "/" + htf2 + "/" + htf3 + ")", btcPx_HTF, btcDom_HTF, others_HTF, stable_HTF, score_HTF, reg_HTF)
+
+// --- RSI panel (optional) ---
+if showRSI
+    rsi = ta.rsi(close, rsiLen)
+    hline(rsiOB, "RSI OB", color=color.new(color.red,70))
+    hline(rsiOS, "RSI OS", color=color.new(color.green,70))
+    plot(rsi, "RSI", color=color.new(color.aqua,0))
+
+// --- Alerts on regime change ---
+ltflabel = regimeLabel(reg_LTF)
+htflabel = regimeLabel(reg_HTF)
+
+alertcondition(ltflabel != ltflabel[1], title="WWASD LTF Regime Shift", message='{"type":"WWASD_RISK","tier":"LTF","label":"' + ltflabel + '","score":' + str.tostring(score_LTF) + '}')
+alertcondition(htflabel != htflabel[1], title="WWASD HTF Regime Shift", message='{"type":"WWASD_RISK","tier":"HTF","label":"' + htflabel + '","score":' + str.tostring(score_HTF) + '}')
+
+// Data Window display for quick debugging
+plotchar(reg_LTF, title="LTF Regime", char="", display=display.data_window)
+plotchar(reg_HTF, title="HTF Regime", char="", display=display.data_window)
