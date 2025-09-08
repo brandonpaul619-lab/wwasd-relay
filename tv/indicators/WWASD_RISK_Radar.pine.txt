@@ -1,6 +1,6 @@
 //@version=6
 indicator("WWASD – Risk Regime Radar (BTC.D / OTHERS.D / Stable.D + BTCPX)",
-     shorttitle="WWASD_RISK", overlay=false, timeframe_gaps=true)
+     shorttitle="WWASD_RISK", overlay=true)
 
 // Inputs: set your symbols here. STABLE dominance defaults to USDT.D; change to STABLE.C.D if needed.
 btcPxSym     = input.symbol("BINANCE:BTCUSDT",     "BTC Price Symbol")
@@ -8,9 +8,9 @@ btcDomSym    = input.symbol("CRYPTOCAP:BTC.D",     "BTC Dominance Symbol")
 othersDomSym = input.symbol("CRYPTOCAP:OTHERS.D",  "Alt Dominance (OTHERS.D) Symbol")
 stableDomSym = input.symbol("CRYPTOCAP:USDT.D",    "Stable Dominance Symbol")
 
-// Timeframes for LTF/HTF groups
-ltf1 = input.string("1",   "LTF #1", options=["1","3","5","15","30","60"])
-ltf2 = input.string("15",  "LTF #2", options=["1","3","5","15","30","60"])
+// Timeframes for LTF/HTF groups (LTF defaults: 5m / 30m / 1h)
+ltf1 = input.string("5",   "LTF #1", options=["3","5","15","30","60"])
+ltf2 = input.string("30",  "LTF #2", options=["3","5","15","30","60"])
 ltf3 = input.string("60",  "LTF #3", options=["15","30","45","60","120"])
 htf1 = input.string("240", "HTF #1 (4H)", options=["120","180","240","360"])
 htf2 = input.string("720", "HTF #2 (12H)", options=["360","720","D"])
@@ -20,11 +20,19 @@ htf3 = input.string("D",   "HTF #3 (1D)",  options=["720","D","2D","3D","W"])
 lookbackBars = input.int(20, "Trend Lookback (bars)", minval=5)
 deadzonePct  = input.float(0.20, "Dead‑zone % (noise filter)", step=0.05)
 
-// RSI display (optional; not used for scoring)
-showRSI      = input.bool(true, "Show RSI (display only)")
-rsiLen       = input.int(14, "RSI Length", minval=2)
-rsiOB        = input.int(70, "RSI Overbought", minval=50, maxval=100)
-rsiOS        = input.int(30, "RSI Oversold",  minval=0,  maxval=50)
+// Rating add-ons (anchored MP-VWAP + Daily EMA12) — used only for scoring; UI table unchanged
+group_add   = "Rating Add-ons"
+useQVWAP    = input.bool(true,  "Include Anchored VWAP (W/M/Q/Y)", group=group_add)
+mpW         = input.bool(true,  "Weekly",   group=group_add)
+mpM         = input.bool(true,  "Monthly",  group=group_add)
+mpQ         = input.bool(true,  "Quarterly",group=group_add)
+mpY         = input.bool(true,  "Yearly",   group=group_add)
+wQVWAP_LTF  = input.float(0.40, "Weight QVWAP LTF (W+M)", minval=0, step=0.05, group=group_add)
+wQVWAP_HTF  = input.float(0.60, "Weight QVWAP HTF (Q+Y)", minval=0, step=0.05, group=group_add)
+useEMA12    = input.bool(true,  "Include 1D 12-EMA", group=group_add)
+wEMA12      = input.float(0.35, "Weight EMA-12 (both)", minval=0, step=0.05, group=group_add)
+
+// RSI display removed (fixed thresholds OB=70 / OS=30, not adjustable)
 
 // --- Helpers ---
 // Percent change over n bars
@@ -38,6 +46,57 @@ trendState(sym, tf) =>
     ch = ta.sma(pctChange(series, lookbackBars), 3)
     ch >  deadzonePct ?  1 : ch < -deadzonePct ? -1 : 0
 
+// Internal calc used inside request.security() to avoid multiline expression errors
+mp_sig_calc() =>
+    // Weekly anchored VWAP
+    _newW = ta.change(time("W")) != 0
+    var float _pvW = na
+    var float _vW  = na
+    _pvW := _newW ? hlc3 * volume : nz(_pvW[1]) + hlc3 * volume
+    _vW  := _newW ? volume        : nz(_vW[1])  + volume
+    _vwW = _vW == 0 ? na : _pvW / _vW
+
+    // Monthly anchored VWAP
+    _newM = ta.change(time("M")) != 0
+    var float _pvM = na
+    var float _vM  = na
+    _pvM := _newM ? hlc3 * volume : nz(_pvM[1]) + hlc3 * volume
+    _vM  := _newM ? volume        : nz(_vM[1])  + volume
+    _vwM = _vM == 0 ? na : _pvM / _vM
+
+    // Quarterly anchored VWAP (Jan/Apr/Jul/Oct)
+    _mo    = month
+    _newQ  = (_newM) and (_mo == 1 or _mo == 4 or _mo == 7 or _mo == 10)
+    var float _pvQ = na
+    var float _vQ  = na
+    _pvQ := _newQ ? hlc3 * volume : nz(_pvQ[1]) + hlc3 * volume
+    _vQ  := _newQ ? volume        : nz(_vQ[1])  + volume
+    _vwQ = _vQ == 0 ? na : _pvQ / _vQ
+
+    // Yearly anchored VWAP
+    _yr    = year
+    _newY  = ta.change(_yr) != 0
+    var float _pvY = na
+    var float _vY  = na
+    _pvY := _newY ? hlc3 * volume : nz(_pvY[1]) + hlc3 * volume
+    _vY  := _newY ? volume        : nz(_vY[1])  + volume
+    _vwY = _vY == 0 ? na : _pvY / _vY
+
+    // Map price vs VWAP to -1/0/+1 with dead-zone (inline to avoid nested function parsing issues)
+    _sW = mpW ? (na(_vwW) ? 0.0 : (math.abs((close - _vwW) / _vwW * 100.0) <= deadzonePct ? 0.0 : (close > _vwW ? 1.0 : -1.0))) : 0.0
+    _sM = mpM ? (na(_vwM) ? 0.0 : (math.abs((close - _vwM) / _vwM * 100.0) <= deadzonePct ? 0.0 : (close > _vwM ? 1.0 : -1.0))) : 0.0
+    _sQ = mpQ ? (na(_vwQ) ? 0.0 : (math.abs((close - _vwQ) / _vwQ * 100.0) <= deadzonePct ? 0.0 : (close > _vwQ ? 1.0 : -1.0))) : 0.0
+    _sY = mpY ? (na(_vwY) ? 0.0 : (math.abs((close - _vwY) / _vwY * 100.0) <= deadzonePct ? 0.0 : (close > _vwY ? 1.0 : -1.0))) : 0.0
+    _sum = _sW + _sM + _sQ + _sY
+    _sum > 0 ? 1.0 : _sum < 0 ? -1.0 : 0.0
+
+// MP-VWAP per-TF wrapper (returns -1/0/+1)
+mp_sig(tf) => request.security(syminfo.tickerid, tf, mp_sig_calc(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// 1D 12-EMA state (binary)
+ema12    = request.security(syminfo.tickerid, "D", ta.ema(close, 12), barmerge.gaps_off, barmerge.lookahead_off)
+ema12_st = close > ema12 ? 1.0 : -1.0
+
 // Calculate risk score: positive values favor risk-on; negative risk-off.
 riskScore(btcPxState, btcDomState, othersState, stableState) =>
     (-1 * btcDomState) + (1 * btcPxState) + (1 * othersState) + (-1 * stableState)
@@ -50,12 +109,21 @@ vote3(a, b, c) =>
     sum = a + b + c
     sum >= 2 ? 1 : sum <= -2 ? -1 : 0
 
-// Convert regime to label string
-regimeLabel(x) => x > 0 ? "RISK_ON" : x < 0 ? "RISK_OFF" : "HOLD"
+// Convert regime/state to label strings (gated BUY/SELL/HOLD)
+regimeLabel(x) => x > 0 ? "BUY" : x < 0 ? "SELL" : "HOLD"
+stateLabel(x)  => x > 0 ? "BUY" : x < 0 ? "SELL" : "HOLD"
 
-// Colour helpers
-colState(x) => x > 0 ? color.lime : x < 0 ? color.red : color.gray
-colRegime(x) => x > 0 ? color.new(color.lime, 80) : x < 0 ? color.new(color.red, 80) : color.new(color.silver, 80)
+// Helper to format one decimal
+fmt1(x) => str.tostring(math.round(x*10.0)/10.0)
+
+// Colours: HOLD=white, BUY=lime, SELL=dark red
+colState(x)  => x > 0 ? color.lime : x < 0 ? color.rgb(139, 0, 0) : color.white
+colRegime(x) => x > 0 ? color.new(color.lime, 80) : x < 0 ? color.new(color.rgb(139, 0, 0), 80) : color.new(color.white, 80)
+
+// Table display options
+showTable       = input.bool(true,  "Show Mini Table (top-right-center)")
+showComponents  = input.bool(false, "Show CONF column", inline="tbl")
+showNAForEmpty  = input.bool(false, "Show — for empty groups", inline="tbl")
 
 // --- Evaluate trend states for each timeframe ---
 evalTf(tf) =>
@@ -80,57 +148,124 @@ btcPx_LTF    = vote3(px1, px2, px3)
 btcDom_LTF   = vote3(dom1, dom2, dom3)
 others_LTF   = vote3(oth1, oth2, oth3)
 stable_LTF   = vote3(st1, st2, st3)
-score_LTF    = riskScore(btcPx_LTF, btcDom_LTF, others_LTF, stable_LTF)
-reg_LTF      = regimeFromScore(score_LTF)
+score_LTF_base = riskScore(btcPx_LTF, btcDom_LTF, others_LTF, stable_LTF)
+// MP-VWAP signals for selected TF sets
+mp_ltf1 = mp_sig(ltf1)
+mp_ltf2 = mp_sig(ltf2)
+mp_ltf3 = mp_sig(ltf3)
+mp_htf1 = mp_sig(htf1)
+mp_htf2 = mp_sig(htf2)
+mp_htf3 = mp_sig(htf3)
+
+avg_mp_ltf = (mp_ltf1 + mp_ltf2 + mp_ltf3) / 3.0
 
 btcPx_HTF    = vote3(px4, px5, px6)
 btcDom_HTF   = vote3(dom4, dom5, dom6)
 others_HTF   = vote3(oth4, oth5, oth6)
 stable_HTF   = vote3(st4, st5, st6)
-score_HTF    = riskScore(btcPx_HTF, btcDom_HTF, others_HTF, stable_HTF)
-reg_HTF      = regimeFromScore(score_HTF)
+score_HTF_base = riskScore(btcPx_HTF, btcDom_HTF, others_HTF, stable_HTF)
+avg_mp_htf = (mp_htf1 + mp_htf2 + mp_htf3) / 3.0
 
-// --- Table rendering ---
-var table t = table.new(position=position.top_right, columns=7, rows=3, border_width=1)
+// Blend: base risk score (normalized to -1..+1) with MP-VWAP and EMA12 pulses
+norm_base_ltf = score_LTF_base / 4.0
+norm_base_htf = score_HTF_base / 4.0
+wSumLTF = 1.0 + (useQVWAP ? wQVWAP_LTF : 0.0) + (useEMA12 ? wEMA12 : 0.0)
+wSumHTF = 1.0 + (useQVWAP ? wQVWAP_HTF : 0.0) + (useEMA12 ? wEMA12 : 0.0)
+blend_ltf = (1.0*norm_base_ltf + (useQVWAP ? wQVWAP_LTF*avg_mp_ltf : 0.0) + (useEMA12 ? wEMA12*ema12_st : 0.0)) / wSumLTF
+blend_htf = (1.0*norm_base_htf + (useQVWAP ? wQVWAP_HTF*avg_mp_htf : 0.0) + (useEMA12 ? wEMA12*ema12_st : 0.0)) / wSumHTF
 
-// Render header once
-if barstate.isfirst
-    table.cell(t, 0, 0, "GROUP",    text_color=color.white)
-    table.cell(t, 1, 0, "BTC PX",    text_color=color.white)
-    table.cell(t, 2, 0, "BTC.D",     text_color=color.white)
-    table.cell(t, 3, 0, "OTHERS.D",  text_color=color.white)
-    table.cell(t, 4, 0, "STABLE.D",  text_color=color.white)
-    table.cell(t, 5, 0, "SCORE",     text_color=color.white)
-    table.cell(t, 6, 0, "REGIME",    text_color=color.white)
+score_LTF = blend_ltf * 4.0
+score_HTF = blend_htf * 4.0
+// Ratings 1..10 from score magnitude (|score| in [0..4])
+ratingFromScore(sc) =>
+    r = 1.0 + (math.abs(sc) / 4.0) * 9.0
+    math.max(1.0, math.min(10.0, math.round(r*10.0)/10.0))
+rating_LTF = ratingFromScore(score_LTF)
+rating_HTF = ratingFromScore(score_HTF)
+// Gate: HOLD when rating < 7; else direction by sign
+reg_LTF = rating_LTF >= 7.0 ? (score_LTF > 0 ? 1 : score_LTF < 0 ? -1 : 0) : 0
+reg_HTF = rating_HTF >= 7.0 ? (score_HTF > 0 ? 1 : score_HTF < 0 ? -1 : 0) : 0
 
-// Helper to render a row
-renderRow(row, name, sPx, sDom, sOth, sSta, sc, reg) =>
-    table.cell(t, 0, row, name)
-    table.cell(t, 1, row, sPx  == 1 ? "▲" : sPx  == -1 ? "▼" : "–", text_color=colState(sPx))
-    table.cell(t, 2, row, sDom == 1 ? "▲" : sDom == -1 ? "▼" : "–", text_color=colState(sDom))
-    table.cell(t, 3, row, sOth == 1 ? "▲" : sOth == -1 ? "▼" : "–", text_color=colState(sOth))
-    table.cell(t, 4, row, sSta == 1 ? "▲" : sSta == -1 ? "▼" : "–", text_color=colState(sSta))
-    table.cell(t, 5, row, str.tostring(sc), text_color=colState(sc))
-    table.cell(t, 6, row, regimeLabel(reg), text_color=color.white, bgcolor=colRegime(reg))
+// Derived labels for table
+sig_ltf = reg_LTF > 0 ? "BUY" : reg_LTF < 0 ? "SELL" : "HOLD"
+sig_htf = reg_HTF > 0 ? "BUY" : reg_HTF < 0 ? "SELL" : "HOLD"
 
-// Draw LTF and HTF rows each bar
-renderRow(1, "LTF (" + ltf1 + "/" + ltf2 + "/" + ltf3 + ")", btcPx_LTF, btcDom_LTF, others_LTF, stable_LTF, score_LTF, reg_LTF)
-renderRow(2, "HTF (" + htf1 + "/" + htf2 + "/" + htf3 + ")", btcPx_HTF, btcDom_HTF, others_HTF, stable_HTF, score_HTF, reg_HTF)
+// Trend (All) row: simple blend of LTF and HTF
+score_all  = (score_LTF + score_HTF) / 2.0
+rating_all = ratingFromScore(score_all)
+sig_all    = rating_all >= 7.0 ? (score_all > 0 ? "BUY" : score_all < 0 ? "SELL" : "HOLD") : "HOLD"
+
+// ───────────── Mini table (top‑right, compact) ─────────────
+colUp   = color.new(color.lime,  0)
+colDown = color.new(color.red,   0)
+// HOLD lettering should be white for legibility on grey
+colHold = color.new(color.white, 0)
+lab_col(lbl) => lbl == "BUY" ? colUp : lbl == "SELL" ? colDown : colHold
+
+cnt_ltf = 3
+cnt_htf = 3
+rat_ltf_str = (showNAForEmpty and cnt_ltf == 0) ? "—" : fmt1(rating_LTF)
+sig_ltf_str = (showNAForEmpty and cnt_ltf == 0) ? "—" : sig_ltf
+rat_htf_str = (showNAForEmpty and cnt_htf == 0) ? "—" : fmt1(rating_HTF)
+sig_htf_str = (showNAForEmpty and cnt_htf == 0) ? "—" : sig_htf
+
+tableBg = color.new(color.rgb(22,13,13), 70)
+var table t = na
+if showTable and na(t)
+    // Header + LTF/HTF/TREND rows; add a slim right spacer column to nudge content left
+    t := table.new(position=position.top_right, columns=(showComponents ? 5 : 4), rows=4, bgcolor=tableBg, border_color=tableBg, border_width=1, frame_color=color.white, frame_width=1)
+
+if showTable and barstate.islast
+    // spacer column index (far right)
+    colSpc = showComponents ? 4 : 3
+    // invisible padding: a few spaces with bg-matched text color
+    pad = "        "
+    // Header
+    table.cell(t, 0, 0, "GRP",    text_color=color.silver, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 0, "RATING", text_color=color.silver, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 0, "SIG",    text_color=color.silver, bgcolor=tableBg, text_size=size.small)
+    if showComponents
+        table.cell(t, 3, 0, "CONF", text_color=color.silver, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, colSpc, 0, pad, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
+    // LTF (display-only TFs)
+    table.cell(t, 0, 1, "LTF (5m/30m/60m)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 1, rat_ltf_str,        text_color=color.white,   bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 1, sig_ltf_str,        text_color=lab_col(sig_ltf), bgcolor=tableBg, text_size=size.small)
+    if showComponents
+        table.cell(t, 3, 1, "—", text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, colSpc, 1, pad, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
+    // HTF (display-only TFs)
+    table.cell(t, 0, 2, "HTF (4h/12h/1d)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 2, rat_htf_str,        text_color=color.white,   bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 2, sig_htf_str,        text_color=lab_col(sig_htf), bgcolor=tableBg, text_size=size.small)
+    if showComponents
+        table.cell(t, 3, 2, "—", text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, colSpc, 2, pad, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
+    // TREND (All)
+    table.cell(t, 0, 3, "TREND (All)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 3, fmt1(rating_all), text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 3, sig_all,          text_color=lab_col(sig_all), bgcolor=tableBg, text_size=size.small)
+    if showComponents
+        table.cell(t, 3, 3, "—", text_color=color.white, bgcolor=tableBg, text_size=size.tiny)
+    table.cell(t, colSpc, 3, pad, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
 
 // --- RSI panel (optional) ---
-if showRSI
-    rsi = ta.rsi(close, rsiLen)
-    hline(rsiOB, "RSI OB", color=color.new(color.red,70))
-    hline(rsiOS, "RSI OS", color=color.new(color.green,70))
-    plot(rsi, "RSI", color=color.new(color.aqua,0))
+// Disabled to keep chart clean (table-only). Re-enable by plotting in a separate pane if needed.
 
 // --- Alerts on regime change ---
 ltflabel = regimeLabel(reg_LTF)
 htflabel = regimeLabel(reg_HTF)
 
-alertcondition(ltflabel != ltflabel[1], title="WWASD LTF Regime Shift", message='{"type":"WWASD_RISK","tier":"LTF","label":"' + ltflabel + '","score":' + str.tostring(score_LTF) + '}')
-alertcondition(htflabel != htflabel[1], title="WWASD HTF Regime Shift", message='{"type":"WWASD_RISK","tier":"HTF","label":"' + htflabel + '","score":' + str.tostring(score_HTF) + '}')
+// Optional alerts for your chart only (no JSON). Toggle by creating an alert in TV with these conditions.
+cond_ltf = ltflabel != ltflabel[1]
+cond_htf = htflabel != htflabel[1]
+alertcondition(cond_ltf, title="WWASD LTF Regime Shift", message="WWASD_RISK_LTF")
+alertcondition(cond_htf, title="WWASD HTF Regime Shift", message="WWASD_RISK_HTF")
 
 // Data Window display for quick debugging
 plotchar(reg_LTF, title="LTF Regime", char="", display=display.data_window)
+plotchar(reg_HTF, title="HTF Regime", char="", display=display.data_window)
 plotchar(reg_HTF, title="HTF Regime", char="", display=display.data_window)
