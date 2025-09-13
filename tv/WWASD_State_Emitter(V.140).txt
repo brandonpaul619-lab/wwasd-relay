@@ -45,9 +45,11 @@ macroDead   = input.float(0.20, "Dead-zone % (treat as flat)", minval=0, step=0.
 macroWeight = input.float(0.0, "Macro weight in rating (0..0.3)", minval=0.0, maxval=0.3, step=0.05, group=group_macro)
 macroSigThr   = input.float(7.0,  "Macro signal threshold (5..10)", minval=5.0, maxval=10.0, step=0.1, group=group_macro)
 macroRecenter = input.float(0.35, "Recenter in chop (0..1)",        minval=0.0, maxval=1.0,  step=0.05, group=group_macro)
-macroRSISym = input.symbol("CRYPTOCAP:TOTAL3", "Macro RSI Symbol (for trend)", group=group_macro)
+// Macro RSI (TOTAL3) — append-only inputs
+macroRSISym = input.symbol("CRYPTOCAP:TOTAL3", "Macro RSI Symbol (Daily)", group=group_macro)
 macroRSILen = input.int(14, "Macro RSI Length (D)", minval=2, group=group_macro)
-macroRSIpts = input.float(1.0, "Macro RSI nudge (±points)", minval=0.0, maxval=2.0, step=0.1, group=group_macro)
+macroRSIpts = input.float(0.5, "Macro RSI nudge (±points)", minval=0.0, maxval=2.0, step=0.1, group=group_macro)
+
 
 
 group_alert = "Alerts / Guards"
@@ -382,7 +384,10 @@ P_STABLES = 0.10 * stb_1h + 0.30 * stb_4h + 0.60 * stb_1d
 // Raw macro rotation in [−2..+2] → 5‑centered rating (every ~0.20 adds ~1 point)
 macro_raw    = P_OTHERS - P_STABLES
 macro_rating = math.max(1.0, math.min(10.0, 5.0 + 2.5 * macro_raw))
-trend_rating = macro_rating  // keep original name for table/UI parity
+trend_rating = macro_rating
+rsiMacroD = request.security(symbol=macroRSISym, timeframe="D", expression=ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+rsiAdj    = macroRSIpts * tanh((rsiMacroD - 50.0) / 10.0)
+trend_rating := math.max(1.0, math.min(10.0, trend_rating + rsiAdj))
 
 // Per‑TF net pulse (−1/0/+1) for payload
 pulse_1h = math.sign((oth_1h - stb_1h) / 2.0)
