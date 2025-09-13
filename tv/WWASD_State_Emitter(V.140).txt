@@ -45,6 +45,9 @@ macroDead   = input.float(0.20, "Dead-zone % (treat as flat)", minval=0, step=0.
 macroWeight = input.float(0.0, "Macro weight in rating (0..0.3)", minval=0.0, maxval=0.3, step=0.05, group=group_macro)
 macroSigThr   = input.float(7.0,  "Macro signal threshold (5..10)", minval=5.0, maxval=10.0, step=0.1, group=group_macro)
 macroRecenter = input.float(0.35, "Recenter in chop (0..1)",        minval=0.0, maxval=1.0,  step=0.05, group=group_macro)
+macroRSISym = input.symbol("CRYPTOCAP:TOTAL3", "Macro RSI Symbol (for trend)", group=group_macro)
+macroRSILen = input.int(14, "Macro RSI Length (D)", minval=2, group=group_macro)
+macroRSIpts = input.float(1.0, "Macro RSI nudge (±points)", minval=0.0, maxval=2.0, step=0.1, group=group_macro)
 
 
 group_alert = "Alerts / Guards"
