@@ -266,6 +266,274 @@ tableBg = color.new(color.rgb(22,13,13), 70)
 var table t = na
 if showTable and na(t)
     // 4 columns: [GRP, RATING, SIG, spacer] ; 4 rows: [pad], LTF, HTF, TREND
+    t := table.new(position=position.top_right, columns=4, rows//@version=6 
+indicator("Risk Regime — (M‑VWAP • EMA12 • RSI)", shorttitle="RISK_REGIME",
+     overlay=true, scale=scale.none, max_labels_count=500, max_lines_count=500)
+
+// ───────────── Inputs ─────────────
+group_sym         = "Symbols"
+othersSym         = input.symbol("CRYPTOCAP:OTHERS.D",   "OTHERS Dominance (OTHERS.D)",   group=group_sym)
+stableSym         = input.symbol("CRYPTOCAP:STABLE.C.D", "Stable Dominance (STABLE.C.D)", group=group_sym)
+
+group_cfg         = "Config"
+lookbackPivot     = input.int(20, "Structure Pivot Len (bars)", minval=5, group=group_cfg)
+macroDead         = input.float(0.20, "Macro dead‑zone % (OTHERS/STABLE)", minval=0, step=0.05, group=group_cfg)
+mvwapAtrK         = input.float(0.50, "Monthly VWAP band = ATR * k", minval=0.1, maxval=2.0, step=0.05, group=group_cfg)
+
+group_rsi         = "RSI (Daily)"
+rsiLen            = input.int(14, "RSI Length", minval=2, group=group_rsi)
+rsiOB             = input.int(70,  "Overbought", minval=50, maxval=100, group=group_rsi)
+rsiOS             = input.int(30,  "Oversold",  minval=0,  maxval=50,  group=group_rsi)
+
+group_gate        = "Signal Gating"
+sigThr            = input.float(7.5, "Rating threshold for BUY/SELL", minval=5.0, maxval=9.9, step=0.1, group=group_gate)
+
+group_ui          = "Display"
+showTable         = input.bool(true, "Show mini table (center‑right)", group=group_ui)
+
+// ───────────── Helpers ─────────────
+fmt1(x) => str.tostring(math.round(x*10.0)/10.0)
+clamp10(x) => math.max(1.0, math.min(10.0, math.round(x*10.0)/10.0))
+boolI(b) => b ? 1 : 0
+
+// 4H % change helper (dominance series) — TF‑independent
+// Keep as a single expression to avoid line‑continuation parse errors in Pine.
+pct_change_daily(sym) => request.security(sym, "240", na(close) or na(close[1]) or close[1] == 0 ? na : ((close - close[1]) / close[1]) * 100.0, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Sign gate with dead‑zone
+sgn_gate(x, dz) => na(x) ? na : x >  dz ?  1 : x < -dz ? -1 : 0
+
+// Structure body used inside security (wraps multi‑statement block)
+struct_body(lb) =>
+    ph = ta.pivothigh(high, lb, lb)
+    pl = ta.pivotlow (low,  lb, lb)
+    lastPH = ta.valuewhen(not na(ph), ph, 0)
+    prevPH = ta.valuewhen(not na(ph), ph, 1)
+    lastPL = ta.valuewhen(not na(pl), pl, 0)
+    prevPL = ta.valuewhen(not na(pl), pl, 1)
+    _hh = not na(lastPH) and not na(prevPH) and lastPH > prevPH
+    _hl = not na(lastPL) and not na(prevPL) and lastPL > prevPL
+    _lh = not na(lastPH) and not na(prevPH) and lastPH < prevPH
+    _ll = not na(lastPL) and not na(prevPL) and lastPL < prevPL
+    [_hh, _hl, _lh, _ll]
+
+// Structure flags wrapper per TF
+struct_tuple(tf, lb) =>
+    request.security(syminfo.tickerid, tf, struct_body(lb), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────── Macro TREND v2 — 5‑centered, 20% steps, long/short symmetric ─────────────
+// % change on fixed TFs (single‑expression bodies to avoid continuation errors)
+pct_change_tf(sym, tf) =>
+    request.security(sym, tf, na(close) or na(close[1]) or close[1]==0 ? na : ((close - close[1]) / close[1]) * 100.0, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Gate to −1/0/+1 per TF, then compute OTHERS−STABLE pulse diff ∈ [−2..+2]
+pulse_diff_tf(tf) =>
+    o = sgn_gate(pct_change_tf(othersSym, tf), macroDead)
+    s = sgn_gate(pct_change_tf(stableSym, tf), macroDead)
+    na(o) or na(s) ? na : (o - s)
+
+// Per‑TF diffs
+d1h = pulse_diff_tf("60")
+d4h = pulse_diff_tf("240")
+d1d = pulse_diff_tf("D")
+
+// Weighted blend → macro_raw ∈ [−2..+2]; normalize to [−1..+1]
+macro_raw  = 0.10 * nz(d1h, 0) + 0.30 * nz(d4h, 0) + 0.60 * nz(d1d, 0)
+macro_norm0 = macro_raw / 2.0
+sumSigns = math.sign(nz(d1h,0)) + math.sign(nz(d4h,0)) + math.sign(nz(d1d,0))
+mixed = (sumSigns != 3) and (sumSigns != -3)  // anything but all‑agree
+macro_norm = mixed ? (macro_norm0 * (1.0 - 0.35)) : macro_norm0
+hasMacro   = not na(d4h) and not na(d1d)  // require core frames
+
+// 5‑centered rating: every 0.20 (~20%) in |macro_norm| adds ~1 point above 5
+//  - macro_norm  =  0.00 → 5.0  (HOLD)
+//  - macro_norm  = +0.20 → 6.0  (BUY)
+//  - macro_norm  = −0.20 → 6.0  (SELL)
+//  - macro_norm  = +1.00 → 10.0 (BUY), only when 1H+4H+1D all agree strongly
+trend_rating = hasMacro ? clamp10(5.0 + 5.0 * math.abs(macro_norm)) : na
+
+// Direction: BUY if macro_norm>0, SELL if <0; gate by intensity around 5 using sigThr
+intensity_ok = hasMacro and (math.abs(trend_rating - 5.0) >= (sigThr - 5.0))  // symmetric gate
+trend_sig    = intensity_ok ? (macro_norm > 0 ? "BUY" : macro_norm < 0 ? "SELL" : "HOLD") : "HOLD"
+recenterK = input.float(0.35, "Recenter speed in chop (0..1)", minval=0.0, maxval=1.0, step=0.05)
+
+// ───────────── Daily states (EMA12 • RSI • Monthly‑Anchored VWAP) ─────────────
+// 1D EMA‑12 and slope
+[close_D, ema12_D, ema12_D_1] = request.security(syminfo.tickerid, "D", [close, ta.ema(close, 12), ta.ema(close, 12)[1]], barmerge.gaps_off, barmerge.lookahead_off)
+ema12_state   = close_D > ema12_D ? "above" : "below"
+ema12_slopeUp = ema12_D > ema12_D_1
+ema12_slopeDn = ema12_D < ema12_D_1
+
+// 1D RSI
+rsiD = request.security(syminfo.tickerid, "D", ta.rsi(close, rsiLen), barmerge.gaps_off, barmerge.lookahead_off)
+rsi_50_up   = rsiD > 50 and nz(rsiD[1]) <= 50
+rsi_50_down = rsiD < 50 and nz(rsiD[1]) >= 50
+rsi_overbought = rsiD > rsiOB
+rsi_oversold   = rsiD < rsiOS
+
+// ───────────── VWAP anchor (Monthly‑D or Quarterly‑4H) ─────────────
+mvwapAnchor = input.string("Quarterly 4H", "VWAP Anchor", options=["Monthly D", "Quarterly 4H"], group=group_cfg)
+
+// Monthly‑anchored VWAP (computed on D)
+mvwap_tuple_D() =>
+    var float cumPV = na
+    var float cumV  = na
+    newM = ta.change(time("M")) != 0
+    if newM or na(cumPV) or na(cumV)
+        cumPV := 0.0
+        cumV  := 0.0
+    cumPV += hlc3 * volume
+    cumV  += volume
+    vwap  = cumV > 0 ? cumPV / cumV : na
+    atr   = ta.atr(14)
+    band  = atr * mvwapAtrK
+    slope = vwap - vwap[1]
+    [vwap, band, slope]
+
+// Quarterly‑anchored VWAP (computed on 4H; quarters = Jan/Apr/Jul/Oct)
+qvwap_tuple_4H() =>
+    var float cumPV = na
+    var float cumV  = na
+    newM = ta.change(time("M")) != 0
+    newQ = newM and (month == 1 or month == 4 or month == 7 or month == 10)
+    if newQ or na(cumPV) or na(cumV)
+        cumPV := 0.0
+        cumV  := 0.0
+    cumPV += hlc3 * volume
+    cumV  += volume
+    vwap  = cumV > 0 ? cumPV / cumV : na
+    atr   = ta.atr(14)
+    band  = atr * mvwapAtrK
+    slope = vwap - vwap[1]
+    [vwap, band, slope]
+
+// Get both versions (no var TF in request.security)
+[mvwapD,  mBandD,  mSlopeD]  = request.security(syminfo.tickerid, "D",   mvwap_tuple_D(),   barmerge.gaps_off, barmerge.lookahead_off)
+[qvwap4h, qBand4h, qSlope4h] = request.security(syminfo.tickerid, "240", qvwap_tuple_4H(),  barmerge.gaps_off, barmerge.lookahead_off)
+
+// Reference closes to compare against the chosen VWAP
+close_4H = request.security(syminfo.tickerid, "240", close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Select anchor
+useQ      = mvwapAnchor == "Quarterly 4H"
+vwapX     = useQ ? qvwap4h : mvwapD
+bandX     = useQ ? qBand4h : mBandD
+slopeX    = useQ ? qSlope4h : mSlopeD
+closeX    = useQ ? close_4H : close_D
+
+// Location buckets vs VWAP (+/− band) using the selected anchor
+mv_above     = closeX > (vwapX + bandX)
+mv_below     = closeX < (vwapX - bandX)
+mv_mid_upper = not mv_above and closeX >= vwapX
+mv_mid_lower = not mv_below and closeX <  vwapX
+
+mv_state = mv_above ? "above" :
+          mv_mid_upper ? "mid_to_upper" :
+          mv_mid_lower ? "mid_to_lower" : "below"
+
+// Slope direction from selected anchor
+mv_slopeUp = slopeX > 0
+mv_slopeDn = slopeX < 0
+
+// Flat slope penalty detector on the same TF as the chosen anchor
+atr_sel   = request.security(syminfo.tickerid, useQ ? "240" : "D", ta.atr(14), barmerge.gaps_off, barmerge.lookahead_off)
+flatSlope = math.abs(slopeX) < (0.05 * atr_sel)  // ~5% ATR band ≈ “flatish”
+
+// ───────────── LTF (5m/30m/60m) & HTF (4h/12h/1D) structure ─────────────
+[hh_5,  hl_5,  lh_5,  ll_5 ] = struct_tuple("5",   lookbackPivot)
+[hh_30, hl_30, lh_30, ll_30] = struct_tuple("30",  lookbackPivot)
+[hh_60, hl_60, lh_60, ll_60] = struct_tuple("60",  lookbackPivot)
+
+[hh_4h, hl_4h, lh_4h, ll_4h] = struct_tuple("240", lookbackPivot)
+[hh_12h,hl_12h,lh_12h,ll_12h]= struct_tuple("720", lookbackPivot)
+[hh_1d, hl_1d, lh_1d, ll_1d] = struct_tuple("D",   lookbackPivot)
+
+// Votes
+lt_votes_long  = (boolI(hh_5 or hl_5) + boolI(hh_30 or hl_30) + boolI(hh_60 or hl_60))
+lt_votes_short = (boolI(lh_5 or ll_5) + boolI(lh_30 or ll_30) + boolI(lh_60 or ll_60))
+
+ht_votes_long  = (boolI(hh_4h or hl_4h) + boolI(hh_12h or hl_12h) + boolI(hh_1d or hl_1d))
+ht_votes_short = (boolI(lh_4h or ll_4h) + boolI(hh_12h or ll_12h) + boolI(lh_1d or ll_1d))
+
+struct_long_ltf   = lt_votes_long  >= 2
+struct_short_ltf  = lt_votes_short >= 2
+struct_mixed_ltf  = struct_long_ltf and struct_short_ltf
+
+struct_long_htf   = ht_votes_long  >= 2
+struct_short_htf  = ht_votes_short >= 2
+struct_mixed_htf  = struct_long_htf and struct_short_htf
+
+// ───────────── Deterministic rating recipe ─────────────
+loc_long_full  = (ema12_state=="above") and (mv_state=="above" or mv_state=="mid_to_upper") and (ema12_slopeUp and mv_slopeUp)
+loc_short_full = (ema12_state=="below") and (mv_state=="below" or mv_state=="mid_to_lower") and (ema12_slopeDn and mv_slopeDn)
+loc_long_half  = (ema12_state=="above") or (mv_state=="above" or mv_state=="mid_to_upper")
+loc_short_half = (ema12_state=="below") or (mv_state=="below" or mv_state=="mid_to_lower")
+
+locCred_long  = loc_long_full  ? 0.6 : (loc_long_half  ? 0.3 : 0.0)
+locCred_short = loc_short_full ? 0.6 : (loc_short_half ? 0.3 : 0.0)
+
+trigCred_long  = (rsi_50_up)   ? 0.4 : 0.0
+trigCred_short = (rsi_50_down) ? 0.4 : 0.0
+
+macroWeight = 0.8
+macroCred_long  = hasMacro and trend_sig == "BUY"  ? macroWeight : 0.0
+macroCred_short = hasMacro and trend_sig == "SELL" ? macroWeight : 0.0
+
+pen_mid_flat    = ((mv_state=="mid_to_upper" or mv_state=="mid_to_lower") and flatSlope) ? 0.4 : 0.0
+pen_chase_long  = (rsi_overbought ? 0.4 : 0.0)
+pen_chase_short = (rsi_oversold   ? 0.4 : 0.0)
+
+// HTF ratings
+struct_long_htf_pure  = struct_long_htf and not struct_short_htf
+struct_short_htf_pure = struct_short_htf and not struct_long_htf
+structure_long_htf    = struct_mixed_htf ? -0.6 : (struct_long_htf_pure  ? 0.6 : 0.0)
+structure_short_htf   = struct_mixed_htf ? -0.6 : (struct_short_htf_pure ? 0.6 : 0.0)
+pen_long_htf  = pen_mid_flat + pen_chase_long
+pen_short_htf = pen_mid_flat + pen_chase_short
+
+raw_long_htf  = macroCred_long  + structure_long_htf  + locCred_long  + trigCred_long  - pen_long_htf
+raw_short_htf = macroCred_short + structure_short_htf + locCred_short + trigCred_short - pen_short_htf
+
+norm(r) =>
+    // Map an empirical range [-1.4 .. +2.6] → [1..10]
+    rr = 1.0 + ((r + 1.4) / 4.0) * 9.0
+    clamp10(rr)
+
+htf_rating_long  = norm(raw_long_htf)
+htf_rating_short = norm(raw_short_htf)
+htf_sig = htf_rating_long > htf_rating_short and htf_rating_long >= sigThr ? "BUY" :
+          htf_rating_short > htf_rating_long and htf_rating_short >= sigThr ? "SELL" : "HOLD"
+htf_rating = htf_sig == "BUY"  ? htf_rating_long :
+             htf_sig == "SELL" ? htf_rating_short : math.max(htf_rating_long, htf_rating_short)
+
+// LTF ratings (reuse daily location/trigger/macro; structure from LTF vote)
+struct_long_ltf_pure  = struct_long_ltf and not struct_short_ltf
+struct_short_ltf_pure = struct_short_ltf and not struct_long_ltf
+structure_long_ltf    = struct_mixed_ltf ? -0.6 : (struct_long_ltf_pure  ? 0.6 : 0.0)
+structure_short_ltf   = struct_mixed_ltf ? -0.6 : (struct_short_ltf_pure ? 0.6 : 0.0)
+pen_long_ltf  = pen_mid_flat + pen_chase_long
+pen_short_ltf = pen_mid_flat + pen_chase_short
+
+raw_long_ltf  = macroCred_long  + structure_long_ltf  + locCred_long  + trigCred_long  - pen_long_ltf
+raw_short_ltf = macroCred_short + structure_short_ltf + locCred_short + trigCred_short - pen_short_ltf
+
+ltf_rating_long  = norm(raw_long_ltf)
+ltf_rating_short = norm(raw_short_ltf)
+ltf_sig = ltf_rating_long > ltf_rating_short and ltf_rating_long >= sigThr ? "BUY" :
+          ltf_rating_short > ltf_rating_long and ltf_rating_short >= sigThr ? "SELL" : "HOLD"
+ltf_rating = ltf_sig == "BUY"  ? ltf_rating_long :
+             ltf_sig == "SELL" ? ltf_rating_short : math.max(ltf_rating_long, ltf_rating_short)
+
+// ───────────── Table (top‑right, no headers; with visual top pad & right offset) ─────────────
+colUp   = color.new(color.lime,  0)
+colDown = color.new(color.rgb(139,0,0), 0)
+colHold = color.new(color.white, 0)
+lab_col(lbl) => lbl == "BUY" ? colUp : lbl == "SELL" ? colDown : colHold
+
+tableBg = color.new(color.rgb(22,13,13), 70)
+var table t = na
+if showTable and na(t)
+    // 4 columns: [GRP, RATING, SIG, spacer] ; 4 rows: [pad], LTF, HTF, TREND
     t := table.new(position=position.top_right, columns=4, rows=4, bgcolor=tableBg,
                    frame_color=color.white, frame_width=1, border_color=tableBg, border_width=1)
 
@@ -303,4 +571,3 @@ if showTable and barstate.islast
 plotchar(ltf_rating,   title="LTF Rating",   char="", display=display.data_window)
 plotchar(htf_rating,   title="HTF Rating",   char="", display=display.data_window)
 plotchar(trend_rating, title="TREND Rating", char="", display=display.data_window)
-
