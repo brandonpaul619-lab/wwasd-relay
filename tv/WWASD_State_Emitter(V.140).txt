@@ -50,8 +50,6 @@ macroRSISym = input.symbol("CRYPTOCAP:TOTAL3", "Macro RSI Symbol (Daily)", group
 macroRSILen = input.int(14, "Macro RSI Length (D)", minval=2, group=group_macro)
 macroRSIpts = input.float(0.5, "Macro RSI nudge (±points)", minval=0.0, maxval=2.0, step=0.1, group=group_macro)
 
-
-
 group_alert = "Alerts / Guards"
 dedupeBarsD = input.int(3, "A+ dedupe (daily bars)", minval=1, group=group_alert)
 
@@ -381,20 +379,40 @@ stb_1d = stb_1d_i
 P_OTHERS  = 0.10 * oth_1h + 0.30 * oth_4h + 0.60 * oth_1d
 P_STABLES = 0.10 * stb_1h + 0.30 * stb_4h + 0.60 * stb_1d
 
-// Raw macro rotation in [−2..+2] → 5‑centered rating (every ~0.20 adds ~1 point)
-macro_raw    = P_OTHERS - P_STABLES
-macro_rating = math.max(1.0, math.min(10.0, 5.0 + 2.5 * macro_raw))
-trend_rating = macro_rating
-rsiMacroD = request.security(symbol=macroRSISym, timeframe="D", expression=ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-rsiAdj    = macroRSIpts * tanh((rsiMacroD - 50.0) / 10.0)
-trend_rating := math.max(1.0, math.min(10.0, trend_rating + rsiAdj))
+// Raw macro rotation in [−2..+2] → pulses-only rating (5-centered)
+macro_raw  = P_OTHERS - P_STABLES
 
-// Per‑TF net pulse (−1/0/+1) for payload
+// 1) Order of ops (prevents whipsaws)
+//    rating_raw   = 5 + 2.5*macro_raw
+//    rating_s     = ema(rating_raw, 2)
+//    adj_total3   = macroRSIpts * tanh((RSI_T3-50)/10)
+//    rating_final = clamp(rating_s + adj_total3, 1, 10)
+rating_raw = 5.0 + 2.5 * macro_raw
+rating_s   = nz(ta.ema(rating_raw, 2), rating_raw)
+
+// TOTAL3 RSI (Daily) → bounded ±macroRSIpts nudge AFTER smoothing
+rsiMacroD  = request.security(symbol=macroRSISym, timeframe="D", expression=ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+adj_total3 = macroRSIpts * tanh((rsiMacroD - 50.0) / 10.0)
+
+// 2) Dead‑zone halving (keeps “flat days” flat)
+if math.abs(macro_raw) == 0.0 or math.abs(rating_s - 5.0) < 0.2
+    adj_total3 *= 0.5
+
+rating_final = math.max(1.0, math.min(10.0, rating_s + adj_total3))
+
+// Back‑compat keep (some downstream code may read macro_rating)
+macro_rating = math.max(1.0, math.min(10.0, rating_raw))
+
+// Exported macro trend number
+trend_rating = rating_final
+
+// Per‑TF net pulse (−1/0/+1) for payload (unchanged)
 pulse_1h = math.sign((oth_1h - stb_1h) / 2.0)
 pulse_4h = math.sign((oth_4h - stb_4h) / 2.0)
 pulse_1d = math.sign((oth_1d - stb_1d) / 2.0)
 
 // Signal with hysteresis (±0.2) + flip margin (|macro_raw| ≥ 0.2)
+// Hysteresis: BUY ≥ 6.0 / SELL ≤ 4.0 with ±0.2 margin (unchanged)
 UP_THR = 6.0
 DN_THR = 4.0
 HYST   = 0.2
@@ -402,17 +420,17 @@ MARG   = 0.2
 
 var string trend_sig = "HOLD"
 if trend_sig == "BUY"
-    if macro_rating < (UP_THR - HYST) or math.abs(macro_raw) < MARG
+    if trend_rating < (UP_THR - HYST) or math.abs(macro_raw) < MARG
         trend_sig := "HOLD"
 else if trend_sig == "SELL"
-    if macro_rating > (DN_THR + HYST) or math.abs(macro_raw) < MARG
+    if trend_rating > (DN_THR + HYST) or math.abs(macro_raw) < MARG
         trend_sig := "HOLD"
 else
-    if macro_rating >= (UP_THR + HYST) and math.abs(macro_raw) >= MARG
+    if trend_rating >= (UP_THR + HYST) and math.abs(macro_raw) >= MARG
         trend_sig := "BUY"
-    else if macro_rating <= (DN_THR - HYST) and math.abs(macro_raw) >= MARG
+    else if trend_rating <= (DN_THR - HYST) and math.abs(macro_raw) >= MARG
         trend_sig := "SELL"
-
+        
 // ───────────────────────── Ratings (v1) — daily only ─────────────────────────
 // Structure flags
 struct_long  = hh_D or hl_D
@@ -492,10 +510,6 @@ mpvwap_calc() =>
     cumPV += hlc3 * volume
     cumV  += volume
     cumV > 0 ? cumPV / cumV : na
-
-mpvwapD = request.security(syminfo.tickerid, "D", mpvwap_calc(), barmerge.gaps_off, barmerge.lookahead_off)
-mpvwap_above = close_D > mpvwapD
-
 // Simple internal Order Block (OB) heuristic on selected TF
 var float ob_lastHigh = na
 var float ob_lastLow  = na
@@ -519,6 +533,9 @@ if ob_enabled
         ob_state := "none"
 else
     ob_state := "none"
+    
+mpvwapD = request.security(syminfo.tickerid, "D", mpvwap_calc(), barmerge.gaps_off, barmerge.lookahead_off)
+mpvwap_above = close_D > mpvwapD
 
 // Indicator scores for LTF rating (normalized)
 score_vwap = tanh( (close_D - mpvwapD) / (atrD * kv) )
