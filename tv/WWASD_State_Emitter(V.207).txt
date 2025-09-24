@@ -1,0 +1,460 @@
+//@version=6
+indicator("WWASD_State_Emitter", overlay=true, scale=scale.none)
+
+// ───────────────────────── Inputs (minimal; no desk knobs) ─────────────────────────
+useDailyVWAP = input.bool(true, "Include Daily VWAP checks")
+lookback     = input.int(20, "Structure Lookback (bars)", minval=5)
+
+othersSym   = input.symbol("CRYPTOCAP:OTHERS.D",   "OTHERS.D")
+stableSym   = input.symbol("CRYPTOCAP:STABLE.C.D", "STABLE.C.D")
+macroWeight = input.float(0.0,  "Macro bleed into micro (0..0.3)", minval=0.0, maxval=0.3, step=0.05)   // keep @0.0
+macroRSISym = input.symbol("CRYPTOCAP:TOTAL3", "Macro RSI Symbol (Daily)")
+macroRSILen = input.int(14, "Macro RSI Length (D)", minval=2)
+macroRSIpts = input.float(0.10, "Macro RSI nudge (±points)", minval=0.0, maxval=2.0, step=0.1)
+dedupeBarsD = input.int(3, "A+ dedupe (daily bars)", minval=1)
+
+// ───────────────────────── Fixed constants (handshake locks) ─────────────────────────
+SIG_THRESH_LTF = 6.6
+SIG_THRESH_HTF = 6.8
+SIG_MARGIN     = 0.3
+DEBOUNCE_LTF   = 1
+DEBOUNCE_HTF   = 1
+ADR_LEN        = 14
+ADR_PCT_GATE   = 80.0
+ANTICHASE_PEN  = 0.2
+
+// ───────────────────────── Helpers ─────────────────────────
+boolToStr(b) => b ? "true" : "false"
+fmt1(x) => str.tostring(math.round(x*10.0)/10.0)
+tanhN(x) =>
+    e2 = math.exp(2.0 * x)
+    (e2 - 1.0) / (e2 + 1.0)
+clampBand42_99(x) => math.max(4.2, math.min(9.9, math.round(x*10.0)/10.0))
+pct_change_daily(sym) =>
+    c  = request.security(sym, "D", close,    barmerge.gaps_off, barmerge.lookahead_off)
+    c1 = request.security(sym, "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+    na(c) or na(c1) or c1 == 0 ? 0.0 : ((c - c1) / c1) * 100.0
+
+// ── Kaufman Efficiency Ratio (ER) — LTF adaptivity only (Pine‑safe, no ta.sum) ─────
+clamp01(x) => math.max(0.0, math.min(1.0, x))
+ker_calc(len) =>
+    // net change over len bars (guard for early bars)
+    dir = math.abs(close - nz(close[len], close))
+    // rolling sum(|Δ|, len) via SMA * len; guard NA early
+    volAvg = ta.sma(math.abs(close - close[1]), len)
+    vol    = na(volAvg) ? 0.0 : volAvg * len
+    clamp01(vol > 0 ? dir / vol : 0.0)
+
+ER_LEN = 20
+er5   = request.security(syminfo.tickerid, "5",  ker_calc(ER_LEN), barmerge.gaps_off, barmerge.lookahead_off)
+er30  = request.security(syminfo.tickerid, "30", ker_calc(ER_LEN), barmerge.gaps_off, barmerge.lookahead_off)
+er60  = request.security(syminfo.tickerid, "60", ker_calc(ER_LEN), barmerge.gaps_off, barmerge.lookahead_off)
+er_ltf = clamp01((er5 + er30 + er60) / 3.0)
+// Trend → tighter spread; chop → wider spread
+SPREAD_LTF_MIN = 0.22
+SPREAD_LTF_MAX = 0.38
+SPREAD_LTF_adapt = SPREAD_LTF_MIN + (1.0 - er_ltf) * (SPREAD_LTF_MAX - SPREAD_LTF_MIN)
+
+// ───────────────────────── 5m structure + 5m close for Q‑VWAP trigger ─────────────────────────
+ltfPivotLen = 5
+ph_5 = request.security(syminfo.tickerid, "5",  ta.pivothigh(high, ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+pl_5 = request.security(syminfo.tickerid, "5",  ta.pivotlow (low,  ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+hh_5 = not na(ta.valuewhen(not na(ph_5), ph_5, 0)) and not na(ta.valuewhen(not na(ph_5), ph_5, 1)) and ta.valuewhen(not na(ph_5), ph_5, 0) > ta.valuewhen(not na(ph_5), ph_5, 1)
+hl_5 = not na(ta.valuewhen(not na(pl_5), pl_5, 0)) and not na(ta.valuewhen(not na(pl_5), pl_5, 1)) and ta.valuewhen(not na(pl_5), pl_5, 0) > ta.valuewhen(not na(pl_5), pl_5, 1)
+lh_5 = not na(ta.valuewhen(not na(ph_5), ph_5, 0)) and not na(ta.valuewhen(not na(ph_5), ph_5, 1)) and ta.valuewhen(not na(ph_5), ph_5, 0) < ta.valuewhen(not na(ph_5), ph_5, 1)
+ll_5 = not na(ta.valuewhen(not na(pl_5), pl_5, 0)) and not na(ta.valuewhen(not na(pl_5), pl_5, 1)) and ta.valuewhen(not na(pl_5), pl_5, 0) < ta.valuewhen(not na(pl_5), pl_5, 1)
+close_5   = request.security(syminfo.tickerid, "5",  close,  barmerge.gaps_off, barmerge.lookahead_off)
+close_5_1 = request.security(syminfo.tickerid, "5",  close[1], barmerge.gaps_off, barmerge.lookahead_off)
+close_5_2 = request.security(syminfo.tickerid, "5",  close[2], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 30m (LTF vote leg) ─────────────────────────
+ema100_30 = request.security(syminfo.tickerid, "30", ta.ema(close, 100), barmerge.gaps_off, barmerge.lookahead_off)
+state30   = request.security(syminfo.tickerid, "30", close,              barmerge.gaps_off, barmerge.lookahead_off) > ema100_30 ? "above" : "below"
+ph_30 = request.security(syminfo.tickerid, "30", ta.pivothigh(high, ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+pl_30 = request.security(syminfo.tickerid, "30", ta.pivotlow (low,  ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+hh_30 = not na(ta.valuewhen(not na(ph_30), ph_30, 0)) and not na(ta.valuewhen(not na(ph_30), ph_30, 1)) and ta.valuewhen(not na(ph_30), ph_30, 0) > ta.valuewhen(not na(ph_30), ph_30, 1)
+hl_30 = not na(ta.valuewhen(not na(pl_30), pl_30, 0)) and not na(ta.valuewhen(not na(pl_30), pl_30, 1)) and ta.valuewhen(not na(pl_30), pl_30, 0) > ta.valuewhen(not na(pl_30), pl_30, 1)
+lh_30 = not na(ta.valuewhen(not na(ph_30), ph_30, 0)) and not na(ta.valuewhen(not na(ph_30), ph_30, 1)) and ta.valuewhen(not na(ph_30), ph_30, 0) < ta.valuewhen(not na(ph_30), ph_30, 1)
+ll_30 = not na(ta.valuewhen(not na(pl_30), pl_30, 0)) and not na(ta.valuewhen(not na(pl_30), pl_30, 1)) and ta.valuewhen(not na(pl_30), pl_30, 0) < ta.valuewhen(not na(pl_30), pl_30, 1)
+
+// ───────────────────────── 60m (LTF vote leg) ─────────────────────────
+ema100_60 = request.security(syminfo.tickerid, "60", ta.ema(close, 100), barmerge.gaps_off, barmerge.lookahead_off)
+state60   = request.security(syminfo.tickerid, "60", close,              barmerge.gaps_off, barmerge.lookahead_off) > ema100_60 ? "above" : "below"
+ph_60 = request.security(syminfo.tickerid, "60", ta.pivothigh(high, ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+pl_60 = request.security(syminfo.tickerid, "60", ta.pivotlow (low,  ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
+hh_60 = not na(ta.valuewhen(not na(ph_60), ph_60, 0)) and not na(ta.valuewhen(not na(ph_60), ph_60, 1)) and ta.valuewhen(not na(ph_60), ph_60, 0) > ta.valuewhen(not na(ph_60), ph_60, 1)
+hl_60 = not na(ta.valuewhen(not na(pl_60), pl_60, 0)) and not na(ta.valuewhen(not na(pl_60), pl_60, 1)) and ta.valuewhen(not na(pl_60), pl_60, 0) > ta.valuewhen(not na(pl_60), pl_60, 1)
+lh_60 = not na(ta.valuewhen(not na(ph_60), ph_60, 0)) and not na(ta.valuewhen(not na(ph_60), ph_60, 1)) and ta.valuewhen(not na(ph_60), ph_60, 0) < ta.valuewhen(not na(ph_60), ph_60, 1)
+ll_60 = not na(ta.valuewhen(not na(pl_60), pl_60, 0)) and not na(ta.valuewhen(not na(pl_60), pl_60, 1)) and ta.valuewhen(not na(pl_60), pl_60, 0) < ta.valuewhen(not na(pl_60), pl_60, 1)
+
+// ───────────────────────── 4H / 12H / 1D structure + steak ─────────────────────────
+ph_240 = request.security(syminfo.tickerid, "240", ta.pivothigh(high, lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+pl_240 = request.security(syminfo.tickerid, "240", ta.pivotlow (low,  lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+hh_240 = not na(ta.valuewhen(not na(ph_240), ph_240, 0)) and not na(ta.valuewhen(not na(ph_240), ph_240, 1)) and ta.valuewhen(not na(ph_240), ph_240, 0) > ta.valuewhen(not na(ph_240), ph_240, 1)
+hl_240 = not na(ta.valuewhen(not na(pl_240), pl_240, 0)) and not na(ta.valuewhen(not na(pl_240), pl_240, 1)) and ta.valuewhen(not na(pl_240), pl_240, 0) > ta.valuewhen(not na(pl_240), pl_240, 1)
+lh_240 = not na(ta.valuewhen(not na(ph_240), ph_240, 0)) and not na(ta.valuewhen(not na(ph_240), ph_240, 1)) and ta.valuewhen(not na(ph_240), ph_240, 0) < ta.valuewhen(not na(ph_240), ph_240, 1)
+ll_240 = not na(ta.valuewhen(not na(pl_240), pl_240, 0)) and not na(ta.valuewhen(not na(pl_240), pl_240, 1)) and ta.valuewhen(not na(pl_240), pl_240, 0) < ta.valuewhen(not na(pl_240), pl_240, 1)
+
+ph_720 = request.security(syminfo.tickerid, "720", ta.pivothigh(high, lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+pl_720 = request.security(syminfo.tickerid, "720", ta.pivotlow (low,  lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+hh_720 = not na(ta.valuewhen(not na(ph_720), ph_720, 0)) and not na(ta.valuewhen(not na(ph_720), ph_720, 1)) and ta.valuewhen(not na(ph_720), ph_720, 0) > ta.valuewhen(not na(ph_720), ph_720, 1)
+hl_720 = not na(ta.valuewhen(not na(pl_720), pl_720, 0)) and not na(ta.valuewhen(not na(pl_720), pl_720, 1)) and ta.valuewhen(not na(pl_720), pl_720, 0) > ta.valuewhen(not na(pl_720), pl_720, 1)
+lh_720 = not na(ta.valuewhen(not na(ph_720), ph_720, 0)) and not na(ta.valuewhen(not na(ph_720), ph_720, 1)) and ta.valuewhen(not na(ph_720), ph_720, 0) < ta.valuewhen(not na(ph_720), ph_720, 1)
+ll_720 = not na(ta.valuewhen(not na(pl_720), pl_720, 0)) and not na(ta.valuewhen(not na(pl_720), pl_720, 1)) and ta.valuewhen(not na(pl_720), pl_720, 0) < ta.valuewhen(not na(pl_720), pl_720, 1)
+
+ph_D = request.security(syminfo.tickerid, "D", ta.pivothigh(high, lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+pl_D = request.security(syminfo.tickerid, "D", ta.pivotlow (low,  lookback, lookback), barmerge.gaps_off, barmerge.lookahead_off)
+hh_D = not na(ta.valuewhen(not na(ph_D), ph_D, 0)) and not na(ta.valuewhen(not na(ph_D), ph_D, 1)) and ta.valuewhen(not na(ph_D), ph_D, 0) > ta.valuewhen(not na(ph_D), ph_D, 1)
+hl_D = not na(ta.valuewhen(not na(pl_D), pl_D, 0)) and not na(ta.valuewhen(not na(pl_D), pl_D, 1)) and ta.valuewhen(not na(pl_D), pl_D, 0) > ta.valuewhen(not na(pl_D), pl_D, 1)
+lh_D = not na(ta.valuewhen(not na(ph_D), ph_D, 0)) and not na(ta.valuewhen(not na(ph_D), ph_D, 1)) and ta.valuewhen(not na(ph_D), ph_D, 0) < ta.valuewhen(not na(ph_D), ph_D, 1)
+ll_D = not na(ta.valuewhen(not na(pl_D), pl_D, 0)) and not na(ta.valuewhen(not na(pl_D), pl_D, 1)) and ta.valuewhen(not na(pl_D), pl_D, 0) < ta.valuewhen(not na(pl_D), pl_D, 1)
+
+close_D   = request.security(syminfo.tickerid, "D", close,              barmerge.gaps_off, barmerge.lookahead_off)
+ema100_D  = request.security(syminfo.tickerid, "D", ta.ema(close, 100), barmerge.gaps_off, barmerge.lookahead_off)
+ema12_D   = request.security(syminfo.tickerid, "D", ta.ema(close, 12),  barmerge.gaps_off, barmerge.lookahead_off)
+close_D_1 = request.security(syminfo.tickerid, "D", close[1],           barmerge.gaps_off, barmerge.lookahead_off)
+ema12_D_1 = request.security(syminfo.tickerid, "D", ta.ema(close, 12)[1], barmerge.gaps_off, barmerge.lookahead_off)
+ema12_state   = close_D > ema12_D ? "above" : "below"
+ema12_reclaim = close_D > ema12_D and close_D_1 <= ema12_D_1
+ema12_loss    = close_D < ema12_D and close_D_1 >= ema12_D_1
+
+// ───────────────────────── Q‑VWAP (Quarter‑anchored on 4H) ─────────────────────────
+qvwap_tuple_4H() =>
+    var float cumPV = na, var float cumV = na
+    newM = ta.change(time("M")) != 0
+    newQ = newM and (month == 1 or month == 4 or month == 7 or month == 10)
+    if newQ or na(cumPV) or na(cumV)
+        cumPV := 0.0, cumV := 0.0
+    cumPV += hlc3 * volume, cumV += volume
+    vwap  = cumV > 0 ? cumPV / cumV : na
+    atr   = ta.atr(14)
+    slope = vwap - vwap[1]
+    band  = atr * 0.50
+    [vwap, band, slope]
+
+[qvwap4H, qBand4H, qSlope4H] = request.security(syminfo.tickerid, "240", qvwap_tuple_4H(), barmerge.gaps_off, barmerge.lookahead_off)
+close_4H = request.security(syminfo.tickerid, "240", close, barmerge.gaps_off, barmerge.lookahead_off)
+qv_above     = close_4H > (qvwap4H + qBand4H)
+qv_below     = close_4H < (qvwap4H - qBand4H)
+qv_mid_upper = not qv_above and close_4H >= qvwap4H
+qv_mid_lower = not qv_below and close_4H <  qvwap4H
+qv_state = qv_above ? "above" : qv_mid_upper ? "mid_to_upper" : qv_mid_lower ? "mid_to_lower" : "below"
+atr4H    = request.security(syminfo.tickerid, "240", ta.atr(14), barmerge.gaps_off, barmerge.lookahead_off)
+flatSlope = math.abs(qSlope4H) < (0.05 * atr4H)
+
+// 5m “hold” re‑entry (wick‑safe)
+two_above          = (close_5  > qvwap4H) and (close_5_1 > qvwap4H)
+two_below          = (close_5  < qvwap4H) and (close_5_1 < qvwap4H)
+cross_up_prev_ok   = (close_5_1 > qvwap4H) and (close_5_2 <= qvwap4H) and (close_5 >= qvwap4H)
+cross_down_prev_ok = (close_5_1 < qvwap4H) and (close_5_2 >= qvwap4H) and (close_5 <= qvwap4H)
+qv_reclaim_hold_5  = two_above or cross_up_prev_ok
+qv_loss_hold_5     = two_below or cross_down_prev_ok
+
+// ───────────────────────── Monday range (with reclaim semantics) ─────────────────────────
+[dDow, dHi, dLo] = request.security(syminfo.tickerid, "D", [dayofweek, high, low], barmerge.gaps_off, barmerge.lookahead_off)
+isMon = dDow == dayofweek.monday
+monHi = ta.valuewhen(isMon, dHi, 0)
+monLo = ta.valuewhen(isMon, dLo, 0)
+monDevAbove = not na(monHi) and close_D > monHi
+monDevBelow = not na(monLo) and close_D < monLo
+var string mon_state = "inside"
+var string mon_state_prev = "inside"
+if barstate.isconfirmed
+    mon_state_prev := mon_state
+    mon_state := na(monHi) or na(monLo) ? "inside" :
+         monDevAbove ? "dev_above" :
+         monDevBelow ? "dev_below" : "inside"
+    if mon_state_prev != "inside" and mon_state == "inside"
+        mon_state := "reclaim_inside"
+mon_hi_swept_15 = request.security(syminfo.tickerid, "15", (high > monHi) and (close <= monHi and close >= monLo), barmerge.gaps_off, barmerge.lookahead_off)
+mon_lo_swept_15 = request.security(syminfo.tickerid, "15", (low  < monLo) and (close <= monHi and close >= monLo), barmerge.gaps_off, barmerge.lookahead_off)
+barsSinceSweep15 = request.security(syminfo.tickerid, "15", ta.barssince(((high > monHi) and (close <= monHi and close >= monLo)) or ((low  < monLo) and (close <= monHi and close >= monLo))), barmerge.gaps_off, barmerge.lookahead_off)
+allowSweep = (barsSinceSweep15 >= 0) and (barsSinceSweep15 <= 4)
+
+// ───────────────────────── Macro TREND (TF‑agnostic; 1H debounce + Monday override) ─────────────────────────
+oChg = pct_change_daily(othersSym)
+sChg = pct_change_daily(stableSym)
+
+dom_struct_body(lb) =>
+    ph = ta.pivothigh(high, lb, lb)
+    pl = ta.pivotlow (low,  lb, lb)
+    lastPH = ta.valuewhen(not na(ph), ph, 0)
+    prevPH = ta.valuewhen(not na(ph), ph, 1)
+    lastPL = ta.valuewhen(not na(pl), pl, 0)
+    prevPL = ta.valuewhen(not na(pl), pl, 1)
+    _hh = not na(lastPH) and not na(prevPH) and lastPH > prevPH
+    _hl = not na(lastPL) and not na(prevPL) and lastPL > prevPL
+    _lh = not na(lastPH) and not na(prevPH) and lastPH < prevPH
+    _ll = not na(lastPL) and not na(prevPL) and lastPL < prevPL
+    [_hh, _hl, _lh, _ll]
+
+qvwap_tuple_dom() =>
+    var float cumPV = na, var float cumV = na
+    newM = ta.change(time("M")) != 0
+    newQ = newM and (month == 1 or month == 4 or month == 7 or month == 10)
+    if newQ or na(cumPV) or na(cumV)
+        cumPV := 0.0, cumV := 0.0
+    cumPV += hlc3 * volume, cumV += volume
+    vwap  = cumV > 0 ? cumPV / cumV : na
+    atr   = ta.atr(14)
+    slope = vwap - vwap[1]
+    [vwap, atr, slope]
+
+dom_pulse_inst(lb) =>
+    e12 = ta.ema(close, 12)
+    emaAbove = close > e12
+    [vwap, atr_, slope] = qvwap_tuple_dom()
+    q_above     = close > (vwap + atr_*0.5)
+    q_below     = close < (vwap - atr_*0.5)
+    q_mid_upper = not q_above and close >= vwap
+    q_mid_lower = not q_below and close <  vwap
+    [hh, hl, lh, ll] = dom_struct_body(lb)
+    flat = math.abs(slope) < (0.05 * atr_)
+    longCond  = emaAbove and (q_above or q_mid_upper) and (hh or hl) and not (lh or ll) and slope > 0 and not flat
+    shortCond = (not emaAbove) and (q_below or q_mid_lower) and (lh or ll) and not (hh or hl) and slope < 0 and not flat
+    longCond ? 1 : shortCond ? -1 : 0
+
+oth_1h_i = request.security(othersSym, "60",  dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+oth_4h_i = request.security(othersSym, "240", dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+oth_1d_i = request.security(othersSym, "D",   dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+stb_1h_i = request.security(stableSym, "60",  dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+stb_4h_i = request.security(stableSym, "240", dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+stb_1d_i = request.security(stableSym, "D",   dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
+
+// 1H debounce with Monday override
+overrideMacro1h = (mon_state == "reclaim_inside") and allowSweep
+oth_1h = overrideMacro1h ? oth_1h_i : (oth_1h_i != 0 and oth_1h_i == nz(oth_1h_i[1]) ? oth_1h_i : 0)
+stb_1h = overrideMacro1h ? stb_1h_i : (stb_1h_i != 0 and stb_1h_i == nz(stb_1h_i[1]) ? stb_1h_i : 0)
+
+// 4H/1D instantaneous
+oth_4h = oth_4h_i
+oth_1d = oth_1d_i
+stb_4h = stb_4h_i
+stb_1d = stb_1d_i
+
+P_OTHERS  = 0.10*oth_1h + 0.30*oth_4h + 0.60*oth_1d
+P_STABLES = 0.10*stb_1h + 0.30*stb_4h + 0.60*stb_1d
+macro_raw = P_OTHERS - P_STABLES
+
+rating_raw = 5.0 + 2.5 * macro_raw
+rating_s   = nz(ta.ema(rating_raw, 2), rating_raw)
+rsiMacroD  = request.security(macroRSISym, "D", ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+adj_total3 = macroRSIpts * tanhN((rsiMacroD - 50.0) / 10.0)
+if math.abs(macro_raw) == 0.0 or math.abs(rating_s - 5.0) < 0.2
+    adj_total3 *= 0.5
+trend_rating = math.max(1.0, math.min(9.9, rating_s + adj_total3))
+
+UP_THR = 6.0, DN_THR = 4.0, HYST = 0.2, MARG = 0.2
+var string trend_sig = "HOLD"
+if trend_sig == "BUY"
+    if trend_rating < (UP_THR - HYST) or math.abs(macro_raw) < MARG
+        trend_sig := "HOLD"
+else if trend_sig == "SELL"
+    if trend_rating > (DN_THR + HYST) or math.abs(macro_raw) < MARG
+        trend_sig := "HOLD"
+else
+    if trend_rating >= (UP_THR + HYST) and math.abs(macro_raw) >= MARG
+        trend_sig := "BUY"
+    else if trend_rating <= (DN_THR - HYST) and math.abs(macro_raw) >= MARG
+        trend_sig := "SELL"
+
+// ───────────────────────── Micro (RSI‑free): HTF & LTF ─────────────────────────
+// HTF structure votes: 4H/12H/1D (≥2 = directional)
+htf_votes_long  = (hh_240 or hl_240 ? 1 : 0) + (hh_720 or hl_720 ? 1 : 0) + (hh_D or hl_D ? 1 : 0)
+htf_votes_short = (lh_240 or ll_240 ? 1 : 0) + (lh_720 or ll_720 ? 1 : 0) + (lh_D or ll_D ? 1 : 0)
+struct_long_htf  = htf_votes_long  >= 2
+struct_short_htf = htf_votes_short >= 2
+struct_mixed_htf = struct_long_htf and struct_short_htf
+pure_long_htf    = struct_long_htf and not struct_short_htf
+pure_short_htf   = struct_short_htf and not struct_long_htf
+
+structure_long_det  = struct_mixed_htf ? -0.6 : pure_long_htf  ? 0.6 : 0.0
+structure_short_det = struct_mixed_htf ? -0.6 : pure_short_htf ? 0.6 : 0.0
+
+longLocA  = (ema12_state == "above")
+longLocB  = (qv_state == "above" or qv_state == "mid_to_upper")
+shortLocA = (ema12_state == "below")
+shortLocB = (qv_state == "below" or qv_state == "mid_to_lower")
+loc_long_det  = (longLocA and longLocB)  ? 0.6 : ((longLocA != longLocB)  ? 0.3 : 0.0)
+loc_short_det = (shortLocA and shortLocB) ? 0.6 : ((shortLocA != shortLocB) ? 0.3 : 0.0)
+
+// HTF triggers = daily EMA‑12 reclaim/loss
+htf_trig_long_bonus  = ema12_reclaim ? 0.4 : 0.0
+htf_trig_short_bonus = ema12_loss    ? 0.4 : 0.0
+
+// Monday bias credit
+bias_long_det  = (mon_state == "reclaim_inside" and mon_state_prev == "dev_below") ? 0.2 : 0.0
+bias_short_det = (mon_state == "reclaim_inside" and mon_state_prev == "dev_above") ? 0.2 : 0.0
+
+// Penalties: mid‑zone + anti‑chase (4H band + slope)
+dayHigh = request.security(syminfo.tickerid, "D", high, barmerge.gaps_off, barmerge.lookahead_off)
+dayLow  = request.security(syminfo.tickerid, "D", low,  barmerge.gaps_off, barmerge.lookahead_off)
+dayRange = math.max(0.0, dayHigh - dayLow)
+adrD     = request.security(syminfo.tickerid, "D", ta.atr(ADR_LEN), barmerge.gaps_off, barmerge.lookahead_off)
+adrPct   = adrD > 0 ? (100.0 * dayRange / adrD) : 0.0
+
+midZone = str.contains(qv_state, "mid")
+antiChaseLong  = (adrPct >= ADR_PCT_GATE) and (close_4H > (qvwap4H + qBand4H)) and (qSlope4H <= 0 or flatSlope)
+antiChaseShort = (adrPct >= ADR_PCT_GATE) and (close_4H < (qvwap4H - qBand4H)) and (qSlope4H >= 0 or flatSlope)
+
+pen_long_det  = (midZone ? -0.2 : 0.0) - (antiChaseLong  ? ANTICHASE_PEN : 0.0)
+pen_short_det = (midZone ? -0.2 : 0.0) - (antiChaseShort ? ANTICHASE_PEN : 0.0)
+
+// HTF ratings (clamped 4.2..9.9)
+rating_long_det  = clampBand42_99(5.0 + structure_long_det  + loc_long_det  + htf_trig_long_bonus  + bias_long_det  + pen_long_det)
+rating_short_det = clampBand42_99(5.0 + structure_short_det + loc_short_det + htf_trig_short_bonus + bias_short_det + pen_short_det)
+
+// LTF votes = 5m structure + 30/60 EMA‑100 fast‑path + triggers
+lt_votes_long  = (hh_5 or hl_5  ? 1 : 0) + (state30=="above" ? 1 : 0) + (state60=="above" ? 1 : 0)
+lt_votes_short = (lh_5 or ll_5  ? 1 : 0) + (state30=="below" ? 1 : 0) + (state60=="below" ? 1 : 0)
+lt_pure_long   = lt_votes_long  >= 2 and lt_votes_short < 2
+lt_pure_short  = lt_votes_short >= 2 and lt_votes_long  < 2
+
+structure_long_ltf_det  = (lt_pure_long  ? 0.6 : (lt_pure_short ? -0.6 : 0.0))
+structure_short_ltf_det = (lt_pure_short ? 0.6 : (lt_pure_long  ? -0.6 : 0.0))
+fast_struct_long  = (state30=="above" and state60=="above") ? 0.6 : (state30=="above" or state60=="above") ? 0.3 : 0.0
+fast_struct_short = (state30=="below" and state60=="below") ? 0.6 : (state30=="below" or state60=="below") ? 0.3 : 0.0
+
+// LTF triggers: Monday reclaim OR 5m Q‑VWAP hold
+monTrigLong  = (mon_state == "reclaim_inside" and mon_state_prev == "dev_below")
+monTrigShort = (mon_state == "reclaim_inside" and mon_state_prev == "dev_above")
+qvTrigLong   = qv_reclaim_hold_5
+qvTrigShort  = qv_loss_hold_5
+
+trig_long_ltf_det  = (monTrigLong  ? 0.4 : 0.0) + (qvTrigLong  ? 0.4 : 0.0)
+trig_short_ltf_det = (monTrigShort ? 0.4 : 0.0) + (qvTrigShort ? 0.4 : 0.0)
+
+pen_long_ltf_det  = (midZone ? -0.2 : 0.0) - (antiChaseLong  ? ANTICHASE_PEN : 0.0)
+pen_short_ltf_det = (midZone ? -0.2 : 0.0) - (antiChaseShort ? ANTICHASE_PEN : 0.0)
+bias_long_ltf_det  = bias_long_det
+bias_short_ltf_det = bias_short_det
+
+ltf_rating_long_det  = clampBand42_99(5.0 + structure_long_ltf_det  + fast_struct_long  + loc_long_det  + trig_long_ltf_det  + bias_long_ltf_det  + pen_long_ltf_det)
+ltf_rating_short_det = clampBand42_99(5.0 + structure_short_ltf_det + fast_struct_short + loc_short_det + trig_short_ltf_det + bias_short_ltf_det + pen_short_ltf_det)
+
+// ───────────────────────── Signals + Debounce ─────────────────────────
+// HTF raw gate (fixed spread)
+string htf_sig_raw = rating_long_det  >= SIG_THRESH_HTF and (rating_long_det  - rating_short_det) >= SIG_MARGIN ? "BUY" :
+                     rating_short_det >= SIG_THRESH_HTF and (rating_short_det - rating_long_det ) >= SIG_MARGIN ? "SELL" : "HOLD"
+
+// HTF micro‑hysteresis: require the stronger rating to actually be moving (±0.05 over 2 bars)
+slopeHTF_long  = rating_long_det  - nz(rating_long_det[2])
+slopeHTF_short = rating_short_det - nz(rating_short_det[2])
+if htf_sig_raw == "BUY"  and slopeHTF_long  < 0.05
+    htf_sig_raw := "HOLD"
+if htf_sig_raw == "SELL" and slopeHTF_short > -0.05
+    htf_sig_raw := "HOLD"
+
+var string htf_sig = "HOLD"
+var string htf_pending = "HOLD"
+var int    htf_pending_count = 0
+if htf_sig_raw == htf_sig or htf_sig_raw == "HOLD"
+    htf_pending := "HOLD", htf_pending_count := 0
+else
+    if htf_pending == htf_sig_raw
+        htf_pending_count += 1
+    else
+        htf_pending := htf_sig_raw, htf_pending_count := 1
+    if htf_pending_count >= DEBOUNCE_HTF
+        htf_sig := htf_sig_raw, htf_pending := "HOLD", htf_pending_count := 0
+
+htf_rating = htf_sig == "BUY" ? rating_long_det : htf_sig == "SELL" ? rating_short_det : math.max(rating_long_det, rating_short_det)
+
+// LTF raw gate — **ER‑adaptive spread**
+string ltf_sig_raw = ltf_rating_long_det  >= SIG_THRESH_LTF and (ltf_rating_long_det  - ltf_rating_short_det) >= SPREAD_LTF_adapt ? "BUY" :
+                     ltf_rating_short_det >= SIG_THRESH_LTF and (ltf_rating_short_det - ltf_rating_long_det ) >= SPREAD_LTF_adapt ? "SELL" : "HOLD"
+
+// LTF micro‑hysteresis: slope requirement (±0.10 over 2 bars)
+slopeLTF_long  = ltf_rating_long_det  - nz(ltf_rating_long_det[2])
+slopeLTF_short = ltf_rating_short_det - nz(ltf_rating_short_det[2])
+if ltf_sig_raw == "BUY"  and slopeLTF_long  < 0.10
+    ltf_sig_raw := "HOLD"
+if ltf_sig_raw == "SELL" and slopeLTF_short > -0.10
+    ltf_sig_raw := "HOLD"
+
+override_debounce_ltf = (mon_state == "reclaim_inside") or qv_reclaim_hold_5 or qv_loss_hold_5
+var string ltf_sig = "HOLD"
+var string ltf_pending = "HOLD"
+var int    ltf_pending_count = 0
+if ltf_sig_raw == ltf_sig or ltf_sig_raw == "HOLD"
+    ltf_pending := "HOLD", ltf_pending_count := 0
+else
+    if override_debounce_ltf
+        ltf_sig := ltf_sig_raw, ltf_pending := "HOLD", ltf_pending_count := 0
+    else
+        if ltf_pending == ltf_sig_raw
+            ltf_pending_count += 1
+        else
+            ltf_pending := ltf_sig_raw, ltf_pending_count := 1
+        if ltf_pending_count >= DEBOUNCE_LTF
+            ltf_sig := ltf_sig_raw, ltf_pending := "HOLD", ltf_pending_count := 0
+
+ltf_rating = ltf_sig == "BUY" ? ltf_rating_long_det : ltf_sig == "SELL" ? ltf_rating_short_det : math.max(ltf_rating_long_det, ltf_rating_short_det)
+ltf_trigger_src = qvTrigLong or qvTrigShort ? "qvwap_reentry" : (monTrigLong or monTrigShort ? "mon_reclaim" : "none")
+
+// ───────────────────────── JSON (clean 1D; Q‑VWAP & EMA12 in ind) ─────────────────────────
+
+// Daily VWAP flags and value (optional)
+vwap_reclaim = useDailyVWAP ? request.security(syminfo.tickerid, "D", close > ta.vwap and close[1] <= ta.vwap, barmerge.gaps_off, lookahead=barmerge.lookahead_off) : false
+vwap_loss    = useDailyVWAP ? request.security(syminfo.tickerid, "D", close < ta.vwap and close[1] >= ta.vwap, barmerge.gaps_off, lookahead=barmerge.lookahead_off) : false
+vwap_D_val   = useDailyVWAP ? request.security(syminfo.tickerid, "D", ta.vwap, barmerge.gaps_off, barmerge.lookahead_off) : na
+
+// MTF buckets (payload: 5, 30, 60, 240, 720, 1D)
+ema_state_5   = close_5 > request.security(syminfo.tickerid,"5",  ta.ema(close,100), barmerge.gaps_off, barmerge.lookahead_off) ? "above":"below"
+ema_state_240 = request.security(syminfo.tickerid,"240", close, barmerge.gaps_off, barmerge.lookahead_off) > request.security(syminfo.tickerid,"240", ta.ema(close,100), barmerge.gaps_off, barmerge.lookahead_off) ? "above":"below"
+ema_state_720 = request.security(syminfo.tickerid,"720", close, barmerge.gaps_off, barmerge.lookahead_off) > request.security(syminfo.tickerid,"720", ta.ema(close,100), barmerge.gaps_off, barmerge.lookahead_off) ? "above":"below"
+ema_state_D   = close_D > ema100_D ? "above" : "below"
+
+mtf_5   = "\"5\":{\"ema100_state\":\""  + ema_state_5   + "\"," + "\"hh\":" + boolToStr(hh_5)   + "," + "\"hl\":" + boolToStr(hl_5)   + "," + "\"lh\":" + boolToStr(lh_5)   + "," + "\"ll\":" + boolToStr(ll_5)   + "}"
+mtf_30  = "\"30\":{\"ema100_state\":\"" + state30       + "\"," + "\"hh\":" + boolToStr(hh_30)  + "," + "\"hl\":" + boolToStr(hl_30)  + "," + "\"lh\":" + boolToStr(lh_30)  + "," + "\"ll\":" + boolToStr(ll_30)  + "}"
+mtf_60  = "\"60\":{\"ema100_state\":\"" + state60       + "\"," + "\"hh\":" + boolToStr(hh_60)  + "," + "\"hl\":" + boolToStr(hl_60)  + "," + "\"lh\":" + boolToStr(lh_60)  + "," + "\"ll\":" + boolToStr(ll_60)  + "}"
+mtf_240 = "\"240\":{\"ema100_state\":\""+ ema_state_240 + "\"," + "\"hh\":" + boolToStr(hh_240) + "," + "\"hl\":" + boolToStr(hl_240) + "," + "\"lh\":" + boolToStr(lh_240) + "," + "\"ll\":" + boolToStr(ll_240) + "}"
+mtf_720 = "\"720\":{\"ema100_state\":\""+ ema_state_720 + "\"," + "\"hh\":" + boolToStr(hh_720) + "," + "\"hl\":" + boolToStr(hl_720) + "," + "\"lh\":" + boolToStr(lh_720) + "," + "\"ll\":" + boolToStr(ll_720) + "}"
+
+// 1D bucket = structure only (no EMA12/QVWAP/RSI here)
+mtf_1D  = "\"1D\":{\"ema100_state\":\"" + ema_state_D   + "\"," +
+          "\"hh\":" + boolToStr(hh_D)   + "," +
+          "\"hl\":" + boolToStr(hl_D)   + "," +
+          "\"lh\":" + boolToStr(lh_D)   + "," +
+          "\"ll\":" + boolToStr(ll_D)   + "}"
+
+// Trend capsule (unchanged shape; TOTAL3 RSI nudge is upstream)
+oChg := pct_change_daily(othersSym)
+sChg := pct_change_daily(stableSym)
+trendStr = "\"trend\":{" + "\"sig\":\"" + (trend_sig== "BUY" ? "BUY" : trend_sig=="SELL" ? "SELL" : "HOLD") + "\",\"source\":\"OTHERS_vs_STABLE\",\"others_d_change\":" + str.tostring(oChg) + ",\"stable_d_change\":" + str.tostring(sChg) + ",\"rating\":" + fmt1(trend_rating) + "}"
+
+// Deterministic components (unchanged)
+string htf_side = htf_sig != "HOLD" ? htf_sig : (rating_long_det >= rating_short_det ? "BUY" : "SELL")
+string ltf_side = ltf_sig != "HOLD" ? ltf_sig : (ltf_rating_long_det >= ltf_rating_short_det ? "BUY" : "SELL")
+compStr = "\"components\":{" + "\"structure\":" + fmt1(htf_side=="BUY"?structure_long_det:structure_short_det) + "," + "\"location\":" + fmt1(htf_side=="BUY"?loc_long_det:loc_short_det) + "," + "\"trigger\":" + fmt1(htf_side=="BUY"?htf_trig_long_bonus:htf_trig_short_bonus) + "," + "\"bias\":" + fmt1(htf_side=="BUY"?bias_long_det:bias_short_det) + "," + "\"penalty\":" + fmt1(htf_side=="BUY"?pen_long_det:pen_short_det) + "}"
+compStr_ltf = "\"components\":{" + "\"structure\":" + fmt1(ltf_side=="BUY"?structure_long_ltf_det:structure_short_ltf_det) + "," +"\"location\":"  + fmt1(ltf_side=="BUY"?loc_long_det:loc_short_det) + "," +"\"trigger\":"   + fmt1(ltf_side=="BUY"?trig_long_ltf_det:trig_short_ltf_det) + "," + "\"bias\":"      + fmt1(ltf_side=="BUY"?bias_long_ltf_det:bias_short_ltf_det) + "," + "\"penalty\":"   + fmt1(ltf_side=="BUY"?pen_long_ltf_det:pen_short_ltf_det) + "}"
+
+// Indicator capsule (QVWAP & EMA‑12 live here; RSI neutral for back‑compat)
+indStr = "\"comp\":{\"ind\":{" + "\"mpvwap\":{\"anchor\":\"Q\",\"tf\":\"240\",\"v\":" + str.tostring(qvwap4H, format.mintick) + ",\"state\":\"" + qv_state + "\"," + "\"reclaim\":" + boolToStr(qv_reclaim_hold_5) + ",\"loss\":" + boolToStr(qv_loss_hold_5) + "}," + "\"ema12_1d\":{\"v\":" + str.tostring(ema12_D, format.mintick) + ",\"above\":" + boolToStr(ema12_state=="above") + ",\"reclaim\":" + boolToStr(ema12_reclaim) + ",\"loss\":" + boolToStr(ema12_loss) + "}" + (useDailyVWAP ? ",\"vwap_1d\":{\"v\":" + str.tostring(vwap_D_val, format.mintick) + ",\"reclaim\":" + boolToStr(vwap_reclaim) + ",\"loss\":" + boolToStr(vwap_loss) + "}" : "") + ",\"rsi\":{\"tf\":\"NONE\",\"len\":0,\"v\":50}" + "}}"
+
+// Final objects
+htfStr = "\"htf\":{" + "\"sig\":\"" + htf_sig + "\",\"rating\":" + fmt1(htf_rating) + "," + compStr + "}"
+ltfStr = "\"ltf\":{" + "\"sig\":\"" + ltf_sig + "\",\"rating\":" + fmt1(ltf_rating) + "," + compStr_ltf + ",\"trigger\":\"" + ltf_trigger_src + "\"," + indStr + "}"
+
+// Final payload (ctx has above_do:null) — includes 12H row
+string commonCore = "\"symbol\":\"" + syminfo.ticker + "\"," + "\"tf_active\":\"" + timeframe.period + "\"," + "\"ts\":" + str.tostring(time) + "," + "\"cmp\":" + str.tostring(close, format.mintick) + "," + "\"is_fresh\":true," + "\"mtf\":{" + mtf_5 + "," + mtf_30 + "," + mtf_60 + "," + mtf_240 + "," + mtf_720 + "," + mtf_1D + "}"
+payload = "{" + "\"type\":\"WWASD_STATE\"," + commonCore + "," + "\"ctx\":{\"above_do\":null,\"mon_state\":\"" + mon_state + "\"}," + trendStr + "," + htfStr + "," + ltfStr + "}"
+
+// ───────────────────────── Alerts ─────────────────────────
+alertcondition(barstate.isconfirmed, title="WWASD Fire (per bar close)")
+if barstate.isconfirmed
+    alert(payload, alert.freq_once_per_bar_close)
+
+// A+: HTF & LTF agree + Monday reclaim (dedupe)
+dIndex = request.security(syminfo.tickerid, "D", bar_index, barmerge.gaps_off, barmerge.lookahead_off)
+var int lastA_Long = na, var int lastA_Short = na
+canEmitLong  = na(lastA_Long)  or (dIndex - lastA_Long  >= dedupeBarsD)
+canEmitShort = na(lastA_Short) or (dIndex - lastA_Short >= dedupeBarsD)
+aplus_long  = htf_sig=="BUY"  and ltf_sig=="BUY"  and (mon_state=="reclaim_inside")
+aplus_short = htf_sig=="SELL" and ltf_sig=="SELL" and (mon_state=="reclaim_inside")
+if barstate.isconfirmed and aplus_long and canEmitLong
+    lastA_Long := dIndex
+    alert("{\"type\":\"WWASD_A_PLUS\",\"symbol\":\"" + syminfo.ticker + "\",\"dir\":\"LONG\",\"rating\":" + fmt1(htf_rating) + "}", alert.freq_once_per_bar_close)
+if barstate.isconfirmed and aplus_short and canEmitShort
+    lastA_Short := dIndex
+    alert("{\"type\":\"WWASD_A_PLUS\",\"symbol\":\"" + syminfo.ticker + "\",\"dir\":\"SHORT\",\"rating\":" + fmt1(htf_rating) + "}", alert.freq_once_per_bar_close)
