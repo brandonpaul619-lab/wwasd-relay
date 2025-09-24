@@ -2,52 +2,71 @@
 indicator("Risk Regime — (Macro TREND • Q‑VWAP • EMA12)", shorttitle="RISK_REGIME",
      overlay=true, scale=scale.none, max_labels_count=500, max_lines_count=500)
 
-// ─────────────────────────────────────── Inputs (minimal UI) ───────────────────────────────────────
+// ───────────── Inputs ─────────────
 group_sym    = "Symbols"
 othersSym    = input.symbol("CRYPTOCAP:OTHERS.D",   "OTHERS Dominance (OTHERS.D)",   group=group_sym)
 stableSym    = input.symbol("CRYPTOCAP:STABLE.C.D", "Stable Dominance (STABLE.C.D)", group=group_sym)
 
 group_cfg    = "Config"
-mvwapAnchor  = input.string("Quarterly 4H", "VWAP Anchor", options=["Monthly D", "Quarterly 4H"], group=group_cfg)
+mvwapAnchor  = input.string("Quarterly 4H", "VWAP Anchor", options=["Monthly D","Quarterly 4H"], group=group_cfg)
 
-// ───────────────── Signal Gating (split thresholds) ─────────────────
 group_gate   = "Signal Gating"
-ltfSigThr    = input.float(6.7, "LTF rating threshold", minval=5.0, maxval=9.9, step=0.1, group=group_gate)
-htfSigThr    = input.float(6.9, "HTF rating threshold", minval=5.0, maxval=9.9, step=0.1, group=group_gate)
+ltfSigThr    = input.float(7.0, "LTF rating threshold", minval=5.0, maxval=9.9, step=0.1, group=group_gate)
+htfSigThr    = input.float(7.0, "HTF rating threshold", minval=5.0, maxval=9.9, step=0.1, group=group_gate)
+SPREAD_LTF   = input.float(0.28, "LTF spread margin (base)", minval=0.20, maxval=0.60, step=0.01, group=group_gate)
+SPREAD_HTF   = input.float(0.30, "HTF spread margin",        minval=0.20, maxval=0.60, step=0.01, group=group_gate)
+tighten      = input.float(1.05, "Tighten ratings (1.00–1.08)", minval=1.00, maxval=1.08, step=0.01, group=group_gate)
+
+// Adaptive + slope gates (toggleable)
+useERAdaptLTF = input.bool(true, "Use ER-adaptive spread (LTF only)", group=group_gate)
+erLen         = input.int(20, "ER length (LTF)", minval=5, maxval=200, group=group_gate)
+useSlopeGate  = input.bool(true, "Use tiny slope gate (flip needs +/−Δ)", group=group_gate)
+slopeMinLTF   = input.float(0.10, "LTF Δ(min) over 2 bars", minval=0.00, maxval=0.50, step=0.01, group=group_gate)
+slopeMinHTF   = input.float(0.05, "HTF Δ(min) over 2 bars", minval=0.00, maxval=0.50, step=0.01, group=group_gate)
 
 group_ui     = "Display"
 showTable    = input.bool(true, "Show mini table", group=group_ui)
-tablePos     = input.string(defval="OG top-right", title="Mini Table Position", options=["OG top-right","Top-center"], group=group_ui)
-f__radar_pos() =>
-    tablePos == "OG top-right" ? position.top_right : position.top_center
+showFlipDelta= input.bool(false, "Show distance to flip (Δ to 7.0)", group=group_ui)
+tablePos     = input.string("OG top-right", "Mini Table Position", options=["OG top-right","Top-center"], group=group_ui)
+f__radar_pos() => tablePos == "OG top-right" ? position.top_right : position.top_center
 
-// ─────────────────────────────────── Internal constants (no UI) ────────────────────────────────────
+// ───────────── Internals ─────────────
 var int   lookbackPivot = 20
-var float macroDead     = 0.20     // dead‑zone for OTHERS−STABLES % diff
-var float mvwapAtrK     = 0.50     // ATR band factor for anchored VWAP
+var float macroDead     = 0.20
+var float mvwapAtrK     = 0.50
 var string macroRSISym  = "CRYPTOCAP:TOTAL3"
 var int    macroRSILen  = 14
-var float  macroRSIpts  = 0.30     // ±0.30 max nudge
-var float  tanhDiv      = 10.0     // tanh divisor for RSI nudge
+var float  macroRSIpts  = 0.10   // TREND nudge only (spec)
+var float  tanhDiv      = 10.0
 
-// ─────────────────────────────────────────── Helpers ────────────────────────────────────────────────
-fmt1(x) => str.tostring(math.round(x*10.0)/10.0)
-clamp10(x) => math.max(1.0, math.min(10.0, math.round(x*10.0)/10.0))
-boolI(b) => b ? 1 : 0
-
-// bounded tanh (portable)
-tanhN(x) =>
+// ───────────── Helpers ─────────────
+fmt1(x)   => str.tostring(math.round(x*10.0)/10.0)
+round1(x) => math.round(x*10.0)/10.0
+clamp10(x)=> math.max(1.0, math.min(10.0, round1(x)))
+boolI(b)  => b ? 1 : 0
+tanhN(x)  =>
     e2 = math.exp(2.0 * x)
     (e2 - 1.0) / (e2 + 1.0)
 
-// % change helper on a TF (single expression prevents continuation issues)
+// % change helper on fixed TF
 pct_change_tf(sym, tf) =>
-    request.security(symbol=sym, timeframe=tf,expression=na(close) or na(close[1]) or close[1]==0 ? 0.0 : ((close - close[1]) / close[1]) * 100.0,gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+    request.security(symbol=sym, timeframe=tf, expression=na(close) or na(close[1]) or close[1]==0 ? 0.0 : ((close - close[1]) / close[1]) * 100.0, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
-// dead‑zone gate → {−1,0,+1}
-sgn_gate(x, dz) => x >  dz ?  1 : x < -dz ? -1 : 0
+// Efficiency Ratio (ER) for adaptivity — ta.sum‑free & continuation‑safe
+calcER(len) =>
+    // absolute net change over 'len' bars
+    ch  = math.abs(close - nz(close[len], close))
+    // volatility = rolling sum of abs 1‑bar changes over 'len'
+    diff = math.abs(ta.change(close))
+    cum  = ta.cum(diff)
+    vo   = cum - nz(cum[len], 0.0)         // rolling sum without ta.sum()
+    er   = vo > 0 ? math.min(1.0, ch / vo) : 0.0
+    er
 
-// Structure body for HH/HL/LH/LL (used in fixed‑TF requests)
+eff_ratio_tf(tf, len) =>
+    request.security(symbol=syminfo.tickerid, timeframe=tf, expression=calcER(len), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// Structure body & wrapper
 struct_body(lb) =>
     ph = ta.pivothigh(high, lb, lb)
     pl = ta.pivotlow (low,  lb, lb)
@@ -55,21 +74,19 @@ struct_body(lb) =>
     prevPH = ta.valuewhen(not na(ph), ph, 1)
     lastPL = ta.valuewhen(not na(pl), pl, 0)
     prevPL = ta.valuewhen(not na(pl), pl, 1)
-    _hh = not na(lastPH) and not na(prevPH) and lastPH > prevPH
-    _hl = not na(lastPL) and not na(prevPL) and lastPL > prevPL
-    _lh = not na(lastPH) and not na(prevPH) and lastPH < prevPH
-    _ll = not na(lastPL) and not na(prevPL) and lastPL < prevPL
-    [_hh, _hl, _lh, _ll]
+    hh = not na(lastPH) and not na(prevPH) and lastPH > prevPH
+    hl = not na(lastPL) and not na(prevPL) and lastPL > prevPL
+    lh = not na(lastPH) and not na(prevPH) and lastPH < prevPH
+    ll = not na(lastPL) and not na(prevPL) and lastPL < prevPL
+    [hh, hl, lh, ll]
 
 struct_tuple(tf, lb) =>
-    request.security(symbol=syminfo.tickerid, timeframe=tf, expression=struct_body(lb),gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+    request.security(symbol=syminfo.tickerid, timeframe=tf, expression=struct_body(lb), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
-// ════════════════════════════════ Macro TREND (OTHERS − STABLES) ════════════════════════════════
-// 1) Per‑TF pulses (fixed TFs; TF‑independent of chart)
+// ───────────── Macro TREND (OTHERS−STABLES) ─────────────
 o_1h = pct_change_tf(othersSym, "60")
 o_4h = pct_change_tf(othersSym, "240")
 o_1d = pct_change_tf(othersSym, "D")
-
 s_1h = pct_change_tf(stableSym, "60")
 s_4h = pct_change_tf(stableSym, "240")
 s_1d = pct_change_tf(stableSym, "D")
@@ -78,31 +95,28 @@ d_1h = o_1h - s_1h
 d_4h = o_4h - s_4h
 d_1d = o_1d - s_1d
 
+sgn_gate(x, dz) => x > dz ? 1 : x < -dz ? -1 : 0
 p_1h = sgn_gate(d_1h, macroDead)
 p_4h = sgn_gate(d_4h, macroDead)
 p_1d = sgn_gate(d_1d, macroDead)
 
-// 2) Weighted pulses → macro_raw ∈ [−2..+2], 5‑centered rating, then smoothed (2‑bar EMA)
-macro_raw  = 2.0 * (0.10 * p_1h + 0.30 * p_4h + 0.60 * p_1d)     // risk‑on when OTHERS↑ & STABLES↓
+macro_raw  = 2.0 * (0.10 * p_1h + 0.30 * p_4h + 0.60 * p_1d)
 rating_raw = 5.0 + 2.5 * macro_raw
 rating_s   = ta.ema(rating_raw, 2)
 
-// 3) TOTAL3 (daily) RSI nudge, applied **after** smoothing; halved in dead‑zone
-rsiMacroD  = request.security(symbol=macroRSISym, timeframe="D",
-                              expression=ta.rsi(close, macroRSILen),
-                              gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+// TOTAL3 RSI nudge (after smoothing)
+rsiMacroD  = request.security(symbol=macroRSISym, timeframe="D", expression=ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 adj_total3 = macroRSIpts * tanhN((rsiMacroD - 50.0) / tanhDiv)
 if math.abs(macro_raw) == 0.0 or math.abs(rating_s - 5.0) < 0.2
     adj_total3 := adj_total3 * 0.2
 
-// 4) Final TREND rating and LONG/SHORT/HOLD (with ±0.2 hysteresis + |macro_raw| margin)
 trend_rating = clamp10(rating_s + adj_total3)
 
+// TREND label with hysteresis + |macro_raw| margin (TF‑agnostic)
 UP_THR = 6.0
 DN_THR = 4.0
 HYST   = 0.2
 MARG   = 0.2
-
 var string trend_sig = "HOLD"
 if trend_sig == "BUY"
     if trend_rating < (UP_THR - HYST) or math.abs(macro_raw) < MARG
@@ -115,17 +129,14 @@ else
         trend_sig := "BUY"
     else if trend_rating <= (DN_THR - HYST) and math.abs(macro_raw) >= MARG
         trend_sig := "SELL"
-
 trend_sig_txt = trend_sig == "BUY" ? "LONG" : trend_sig == "SELL" ? "SHORT" : "HOLD"
 
-// ───────────────────────────── Daily states (EMA12 • Anchored VWAP) ────────────────────────────────
-// EMA‑12 (1D) state & slope — used for LTF/HTF location logic, not in TREND math
-[close_D, ema12_D, ema12_D_1] = request.security(symbol=syminfo.tickerid, timeframe="D",expression=[close, ta.ema(close, 12), ta.ema(close, 12)[1]],gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+// ───────────── EMA‑12 & Anchored VWAP ─────────────
+[close_D, ema12_D, ema12_D_1] = request.security(symbol=syminfo.tickerid, timeframe="D", expression=[close, ta.ema(close,12), ta.ema(close,12)[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 ema12_state   = close_D > ema12_D ? "above" : "below"
 ema12_slopeUp = ema12_D > ema12_D_1
 ema12_slopeDn = ema12_D < ema12_D_1
 
-// Monthly‑anchored VWAP (on D)
 mvwap_tuple_D() =>
     var float cumPV = na
     var float cumV  = na
@@ -141,7 +152,6 @@ mvwap_tuple_D() =>
     slope = vwap - vwap[1]
     [vwap, band, slope]
 
-// Quarterly‑anchored VWAP (on 4H; Jan/Apr/Jul/Oct resets)
 qvwap_tuple_4H() =>
     var float cumPV = na
     var float cumV  = na
@@ -158,10 +168,9 @@ qvwap_tuple_4H() =>
     slope = vwap - vwap[1]
     [vwap, band, slope]
 
-// Fetch both flavors; select via input
-[mvwapD,  mBandD,  mSlopeD]  = request.security(symbol=syminfo.tickerid, timeframe="D",   expression=mvwap_tuple_D(),  gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[mvwapD, mBandD, mSlopeD]    = request.security(symbol=syminfo.tickerid, timeframe="D",   expression=mvwap_tuple_D(),  gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 [qvwap4h, qBand4h, qSlope4h] = request.security(symbol=syminfo.tickerid, timeframe="240", expression=qvwap_tuple_4H(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-close_4H = request.security(symbol=syminfo.tickerid, timeframe="240", expression=close,   gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+close_4H = request.security(symbol=syminfo.tickerid, timeframe="240", expression=close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
 useQ   = mvwapAnchor == "Quarterly 4H"
 vwapX  = useQ ? qvwap4h : mvwapD
@@ -173,124 +182,149 @@ mv_above     = refX > (vwapX + bandX)
 mv_below     = refX < (vwapX - bandX)
 mv_mid_upper = not mv_above and refX >= vwapX
 mv_mid_lower = not mv_below and refX <  vwapX
-
-mv_state = mv_above ? "above" :
-          mv_mid_upper ? "mid_to_upper" :
-          mv_mid_lower ? "mid_to_lower" : "below"
+mv_state = mv_above ? "above" : mv_mid_upper ? "mid_to_upper" : mv_mid_lower ? "mid_to_lower" : "below"
 
 atr_sel   = request.security(symbol=syminfo.tickerid, timeframe=(useQ ? "240" : "D"), expression=ta.atr(14), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-flatSlope = math.abs(slopeX) < (0.05 * atr_sel)  // flat if <~5% ATR
+flatSlope = math.abs(slopeX) < (0.05 * atr_sel)
 
-// ───────────────────────────── LTF (5/30/60) & HTF (4H/12H/1D) structure ────────────────────────────
-[hh_5,  hl_5,  lh_5,  ll_5 ] = struct_tuple("5",   lookbackPivot)
-[hh_30, hl_30, lh_30, ll_30] = struct_tuple("30",  lookbackPivot)
-[hh_60, hl_60, lh_60, ll_60] = struct_tuple("60",  lookbackPivot)
+// ───────────── LTF (5/30/60) & HTF (4H/12H/1D) structure ─────────────
+[hh_5,  hl_5,  lh_5,  ll_5 ] = struct_tuple("5", lookbackPivot)
+[hh_30, hl_30, lh_30, ll_30] = struct_tuple("30", lookbackPivot)
+[hh_60, hl_60, lh_60, ll_60] = struct_tuple("60", lookbackPivot)
 
-[hh_4h, hl_4h, lh_4h, ll_4h] = struct_tuple("240", lookbackPivot)
-[hh_12h,hl_12h,lh_12h,ll_12h]= struct_tuple("720", lookbackPivot)
-[hh_1d, hl_1d, lh_1d, ll_1d] = struct_tuple("D",   lookbackPivot)
+[hh_4h, hl_4h, lh_4h, ll_4h]    = struct_tuple("240", lookbackPivot)
+[hh_12h, hl_12h, lh_12h, ll_12h]= struct_tuple("720", lookbackPivot)
+[hh_1d,  hl_1d,  lh_1d,  ll_1d ]= struct_tuple("D", lookbackPivot)
 
-lt_votes_long  = (boolI(hh_5 or hl_5) + boolI(hh_30 or hl_30) + boolI(hh_60 or hl_60))
-lt_votes_short = (boolI(lh_5 or ll_5) + boolI(lh_30 or ll_30) + boolI(lh_60 or ll_60))
-ht_votes_long  = (boolI(hh_4h or hl_4h) + boolI(hh_12h or hl_12h) + boolI(hh_1d or hl_1d))
-ht_votes_short = (boolI(lh_4h or ll_4h) + boolI(lh_12h or ll_12h) + boolI(lh_1d or ll_1d))
+lt_votes_long  = boolI(hh_5 or hl_5) + boolI(hh_30 or hl_30) + boolI(hh_60 or hl_60)
+lt_votes_short = boolI(lh_5 or ll_5) + boolI(lh_30 or ll_30) + boolI(lh_60 or ll_60)
+ht_votes_long  = boolI(hh_4h or hl_4h) + boolI(hh_12h or hl_12h) + boolI(hh_1d or hl_1d)
+ht_votes_short = boolI(lh_4h or ll_4h) + boolI(lh_12h or ll_12h) + boolI(lh_1d or ll_1d)
 
 struct_long_ltf   = lt_votes_long  >= 2
 struct_short_ltf  = lt_votes_short >= 2
 struct_mixed_ltf  = struct_long_ltf and struct_short_ltf
-
 struct_long_htf   = ht_votes_long  >= 2
 struct_short_htf  = ht_votes_short >= 2
 struct_mixed_htf  = struct_long_htf and struct_short_htf
 
-// ───────────────────────────── Ratings (NO RSI in LTF/HTF) ──────────────────────────────────────────
-// Location credits (EMA12 + anchored VWAP)
-loc_long_full  = (ema12_state=="above") and (mv_state=="above" or mv_state=="mid_to_upper") and (ema12_slopeUp and (slopeX > 0))
-loc_short_full = (ema12_state=="below") and (mv_state=="below" or mv_state=="mid_to_lower") and (ema12_slopeDn and (slopeX < 0))
+// ───────────── Ratings (no RSI in LTF/HTF) ─────────────
+norm(r) =>
+    rr0 = 1.0 + ((r + 1.4) / 4.0) * 9.0
+    rr  = 5.0 + (rr0 - 5.0) * tighten
+    clamp10(rr)
+normband(r) => norm(r) // back‑compat
+
+// Location credits + penalty
+loc_long_full  = (ema12_state=="above") and (mv_state=="above" or mv_state=="mid_to_upper") and ema12_slopeUp and (slopeX > 0)
+loc_short_full = (ema12_state=="below") and (mv_state=="below" or mv_state=="mid_to_lower") and ema12_slopeDn and (slopeX < 0)
 loc_long_half  = (ema12_state=="above") or (mv_state=="above" or mv_state=="mid_to_upper")
 loc_short_half = (ema12_state=="below") or (mv_state=="below" or mv_state=="mid_to_lower")
+locCred_long   = loc_long_full  ? 0.6 : (loc_long_half  ? 0.3 : 0.0)
+locCred_short  = loc_short_full ? 0.6 : (loc_short_half ? 0.3 : 0.0)
+pen_mid_flat   = ((mv_state=="mid_to_upper" or mv_state=="mid_to_lower") and flatSlope) ? 0.4 : 0.0
 
-locCred_long  = loc_long_full  ? 0.6 : (loc_long_half  ? 0.3 : 0.0)
-locCred_short = loc_short_full ? 0.6 : (loc_short_half ? 0.3 : 0.0)
+// Raw → normalized (rounded to 1 decimal for WYSIWYG gating)
+structure_long_htf    = struct_mixed_htf ? -0.6 : (struct_long_htf  and not struct_short_htf ? 0.6 : 0.0)
+structure_short_htf   = struct_mixed_htf ? -0.6 : (struct_short_htf and not struct_long_htf  ? 0.6 : 0.0)
+raw_long_htf  = structure_long_htf  + locCred_long  - pen_mid_flat
+raw_short_htf = structure_short_htf + locCred_short - pen_mid_flat
 
-// Penalty: mid‑zone with flat slope
-pen_mid_flat = ((mv_state=="mid_to_upper" or mv_state=="mid_to_lower") and flatSlope) ? 0.4 : 0.0
+structure_long_ltf    = struct_mixed_ltf ? -0.6 : (struct_long_ltf  and not struct_short_ltf ? 0.6 : 0.0)
+structure_short_ltf   = struct_mixed_ltf ? -0.6 : (struct_short_ltf and not struct_long_ltf  ? 0.6 : 0.0)
+raw_long_ltf  = structure_long_ltf  + locCred_long  - pen_mid_flat
+raw_short_ltf = structure_short_ltf + locCred_short - pen_mid_flat
 
-// HTF raw scores (structure + location − penalty)
-struct_long_htf_pure  = struct_long_htf and not struct_short_htf
-struct_short_htf_pure = struct_short_htf and not struct_long_htf
-structure_long_htf    = struct_mixed_htf ? -0.6 : (struct_long_htf_pure  ? 0.6 : 0.0)
-structure_short_htf   = struct_mixed_htf ? -0.6 : (struct_short_htf_pure ? 0.6 : 0.0)
-pen_long_htf  = pen_mid_flat
-pen_short_htf = pen_mid_flat
-raw_long_htf  = structure_long_htf  + locCred_long  - pen_long_htf
-raw_short_htf = structure_short_htf + locCred_short - pen_short_htf
+htf_rating_long_r  = round1(norm(raw_long_htf))
+htf_rating_short_r = round1(norm(raw_short_htf))
+ltf_rating_long_r  = round1(norm(raw_long_ltf))
+ltf_rating_short_r = round1(norm(raw_short_ltf))
 
-// LTF raw scores (structure votes + same location/penalty)
-struct_long_ltf_pure  = struct_long_ltf and not struct_short_ltf
-struct_short_ltf_pure = struct_short_ltf and not struct_long_ltf
-structure_long_ltf    = struct_mixed_ltf ? -0.6 : (struct_long_ltf_pure  ? 0.6 : 0.0)
-structure_short_ltf   = struct_mixed_ltf ? -0.6 : (struct_short_ltf_pure ? 0.6 : 0.0)
-pen_long_ltf  = pen_mid_flat
-pen_short_ltf = pen_mid_flat
-raw_long_ltf  = structure_long_ltf  + locCred_long  - pen_long_ltf
-raw_short_ltf = structure_short_ltf + locCred_short - pen_short_ltf
+// ───────────── ER‑adaptive spread (LTF only) ─────────────
+// Weighted ER over 5/30/60; range ~0..1 (higher = cleaner trend)
+er5   = eff_ratio_tf("5",   erLen)
+er30  = eff_ratio_tf("30",  erLen)
+er60  = eff_ratio_tf("60",  erLen)
+er_ltf = math.min(1.0, math.max(0.0, 0.40*er5 + 0.35*er30 + 0.25*er60))
 
-// Normalize (empirical map [-1.4..+2.6] → [1..10])
-norm(r) =>
-    rr = 1.0 + ((r + 1.4) / 4.0) * 9.0
-    clamp10(rr)
+// Adapt LTF spread: 0.22 (clean trend) → 0.38 (chop), centered near 0.28
+SPREAD_LTF_eff = useERAdaptLTF ? (0.22 + (1.0 - er_ltf) * 0.16) : SPREAD_LTF
 
-htf_rating_long  = norm(raw_long_htf)
-htf_rating_short = norm(raw_short_htf)
-ltf_rating_long  = norm(raw_long_ltf)
-ltf_rating_short = norm(raw_short_ltf)
+// ───────────── Gating (≥7.0 floor; spreads on rounded values) + slope check ─────────────
+htf_spread_long  = htf_rating_long_r  - htf_rating_short_r
+htf_spread_short = htf_rating_short_r - htf_rating_long_r
+ltf_spread_long  = ltf_rating_long_r  - ltf_rating_short_r
+ltf_spread_short = ltf_rating_short_r - ltf_rating_long_r
 
-// Decide HTF signal + rating (uses stricter HTF threshold)
-htf_sig = htf_rating_long > htf_rating_short and htf_rating_long >= htfSigThr ? "BUY" :
-          htf_rating_short > htf_rating_long and htf_rating_short >= htfSigThr ? "SELL" : "HOLD"
+// Candidate locks (strength + spread)
+htf_buy_cand  = htf_rating_long_r  >= htfSigThr and htf_spread_long  >= SPREAD_HTF
+htf_sell_cand = htf_rating_short_r >= htfSigThr and htf_spread_short >= SPREAD_HTF
+ltf_buy_cand  = ltf_rating_long_r  >= ltfSigThr and ltf_spread_long  >= SPREAD_LTF_eff
+ltf_sell_cand = ltf_rating_short_r >= ltfSigThr and ltf_spread_short >= SPREAD_LTF_eff
 
-// Decide LTF signal + rating (uses more permissive LTF threshold)
-ltf_sig = ltf_rating_long > ltf_rating_short and ltf_rating_long >= ltfSigThr ? "BUY" :
-          ltf_rating_short > ltf_rating_long and ltf_rating_short >= ltfSigThr ? "SELL" : "HOLD"
+// Tiny slope gate over last 2 bars (optional)
+htf_buy_gate  = htf_buy_cand  and (not useSlopeGate or (htf_rating_long_r  - nz(htf_rating_long_r[2],  htf_rating_long_r))  >= slopeMinHTF)
+htf_sell_gate = htf_sell_cand and (not useSlopeGate or (htf_rating_short_r - nz(htf_rating_short_r[2], htf_rating_short_r)) <= -slopeMinHTF)
+ltf_buy_gate  = ltf_buy_cand  and (not useSlopeGate or (ltf_rating_long_r  - nz(ltf_rating_long_r[2],  ltf_rating_long_r))  >= slopeMinLTF)
+ltf_sell_gate = ltf_sell_cand and (not useSlopeGate or (ltf_rating_short_r - nz(ltf_rating_short_r[2], ltf_rating_short_r)) <= -slopeMinLTF)
 
-htf_rating = htf_sig == "BUY"  ? htf_rating_long :
-             htf_sig == "SELL" ? htf_rating_short : math.max(htf_rating_long, htf_rating_short)
-ltf_rating = ltf_sig == "BUY"  ? ltf_rating_long :
-             ltf_sig == "SELL" ? ltf_rating_short : math.max(ltf_rating_long, ltf_rating_short)
+htf_sig = htf_buy_gate ? "BUY" : htf_sell_gate ? "SELL" : "HOLD"
+ltf_sig = ltf_buy_gate ? "BUY" : ltf_sell_gate ? "SELL" : "HOLD"
 
-// ────────────────────────────────────────── Mini Table ──────────────────────────────────────────────
+// Numbers always visible; label shows TREND ↑/↓ until flip
+htf_base_r = math.max(htf_rating_long_r, htf_rating_short_r)
+ltf_base_r = math.max(ltf_rating_long_r, ltf_rating_short_r)
+htf_arrow  = htf_rating_long_r >= htf_rating_short_r ? "↑" : "↓"
+ltf_arrow  = ltf_rating_long_r >= ltf_rating_short_r ? "↑" : "↓"
+
+htf_disp = htf_sig == "BUY"  ? htf_rating_long_r  : htf_sig == "SELL" ? htf_rating_short_r : htf_base_r
+ltf_disp = ltf_sig == "BUY"  ? ltf_rating_long_r  : ltf_sig == "SELL" ? ltf_rating_short_r : ltf_base_r
+htf_num = fmt1(htf_disp)
+ltf_num = fmt1(ltf_disp)
+
+// Δ to 7.0 (optional view)
+htf_delta = math.max(0.0, htfSigThr - htf_base_r)
+ltf_delta = math.max(0.0, ltfSigThr - ltf_base_r)
+htf_delta_txt = showFlipDelta and htf_sig == "HOLD" ? " Δ" + fmt1(htf_delta) : ""
+ltf_delta_txt = showFlipDelta and ltf_sig == "HOLD" ? " Δ" + fmt1(ltf_delta) : ""
+
+// Labels: never blank — show TREND ↑/↓ until BUY/SELL
+label_prefix = "TREND "
+htf_lab = htf_sig == "HOLD" ? label_prefix + htf_arrow : htf_sig
+ltf_lab = ltf_sig == "HOLD" ? label_prefix + ltf_arrow : ltf_sig
+
+// ───────────── Mini Table (single-line calls) ─────────────
 colUp   = color.new(color.lime,  0)
 colDown = color.new(color.rgb(139,0,0), 0)
 colHold = color.new(color.white, 0)
-lab_col(lbl) => lbl == "BUY" or lbl == "LONG" ? colUp : (lbl == "SELL" or lbl == "SHORT" ? colDown : colHold)
+lab_col(lbl) => str.contains(lbl, "BUY") or str.contains(lbl, "LONG") or str.contains(lbl, "↑") ? colUp : str.contains(lbl, "SELL") or str.contains(lbl, "SHORT") or str.contains(lbl, "↓") ? colDown : colHold
 
 tableBg = color.new(color.rgb(22,13,13), 70)
 var table t = na
 if showTable and na(t)
-    t := table.new(position=f__radar_pos(), columns=4, rows=4, bgcolor=tableBg,
-                   frame_color=color.white, frame_width=1, border_color=tableBg, border_width=1)
+    t := table.new(position=f__radar_pos(), columns=4, rows=4, bgcolor=tableBg, frame_color=color.white, frame_width=1, border_color=tableBg, border_width=1)
 
 if showTable and barstate.islast
-    colSpc = 3
-    padTxt = "        "
-    // pad row
-    table.cell(t, 0, 0, padTxt, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    table.cell(t, 1, 0, padTxt, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    table.cell(t, 2, 0, padTxt, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    table.cell(t, colSpc, 0, padTxt, text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    // LTF
+    table.cell(t, 0, 0, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 1, 0, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 0, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 3, 0, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
     table.cell(t, 0, 1, "LTF (5m/30m/60m)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
-    table.cell(t, 1, 1, fmt1(ltf_rating),   text_color=color.white, bgcolor=tableBg, text_size=size.small)
-    table.cell(t, 2, 1, ltf_sig,            text_color=lab_col(ltf_sig), bgcolor=tableBg, text_size=size.small)
-    table.cell(t, colSpc, 1, padTxt,        text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    // HTF
-    table.cell(t, 0, 2, "HTF (4h/12h/1d)",  text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
-    table.cell(t, 1, 2, fmt1(htf_rating),   text_color=color.white, bgcolor=tableBg, text_size=size.small)
-    table.cell(t, 2, 2, htf_sig,            text_color=lab_col(htf_sig), bgcolor=tableBg, text_size=size.small)
-    table.cell(t, colSpc, 2, padTxt,        text_color=tableBg, bgcolor=tableBg, text_size=size.small)
-    // TREND
+    table.cell(t, 1, 1, ltf_num + ltf_delta_txt, text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 1, ltf_lab, text_color=lab_col(ltf_lab), bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 3, 1, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
+    table.cell(t, 0, 2, "HTF (4h/12h/1d)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 2, htf_num + htf_delta_txt, text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 2, htf_lab, text_color=lab_col(htf_lab), bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 3, 2, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
     table.cell(t, 0, 3, "TREND (OTHERS/STABLE)", text_color=color.white, bgcolor=tableBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 3, "—", text_color=color.white, bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 2, 3, trend_sig_txt, text_color=lab_col(trend_sig_txt), bgcolor=tableBg, text_size=size.small)
+    table.cell(t, 3, 3, "        ", text_color=tableBg, bgcolor=tableBg, text_size=size.small)
+
     table.cell(t, 1, 3, fmt1(trend_rating),      text_color=color.white, bgcolor=tableBg, text_size=size.small)
     table.cell(t, 2, 3, trend_sig_txt,           text_color=lab_col(trend_sig_txt), bgcolor=tableBg, text_size=size.small)
     table.cell(t, colSpc, 3, padTxt,             text_color=tableBg, bgcolor=tableBg, text_size=size.small)
