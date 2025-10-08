@@ -1,4 +1,4 @@
-# WWASD Relay v2 (FastAPI)
+Relay v2 (FastAPI)
 
 Drop‑in relay for TradingView alerts. Accepts **JSON** from Pine (`Any alert() function call`) and **multipart** uploads from automation (screenshots). Caches the latest `WWASD_STATE` per symbol and exposes `/tv/latest` for the chat agent.
 
@@ -20,7 +20,7 @@ Drop‑in relay for TradingView alerts. Accepts **JSON** from Pine (`Any alert()
 ## Deploy on Render
 Upload this repo, set env vars, build: `pip install -r requirements.txt`, start: `gunicorn -w 2 -k uvicorn.workers.UvicornWorker app:app`.
 v3
-WWASD Relay — Ops README
+Relay — Ops README
 
 Purpose: serve clean, low‑friction feeds from TradingView alerts and Blofin positions to TV Desk & Port Desk. Everything here is append‑only and compatible with your existing consumers.
 
