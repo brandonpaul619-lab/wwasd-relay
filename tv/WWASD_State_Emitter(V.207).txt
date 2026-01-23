@@ -1,5 +1,5 @@
 //@version=6
-indicator("WWASD_State_Emitter", overlay=true, scale=scale.none)
+indicator("TruCon State Emitter", overlay=true, scale=scale.none)
 
 // ───────────────────────── Inputs (minimal; no desk knobs) ─────────────────────────
 useDailyVWAP = input.bool(true, "Include Daily VWAP checks")
@@ -16,7 +16,7 @@ dedupeBarsD = input.int(3, "A+ dedupe (daily bars)", minval=1)
 // ───────────────────────── Fixed constants (handshake locks) ─────────────────────────
 SIG_THRESH_LTF = 6.6
 SIG_THRESH_HTF = 6.8
-SIG_MARGIN     = 0.3
+SIG_MARGIN     = 0.28
 DEBOUNCE_LTF   = 1
 DEBOUNCE_HTF   = 1
 ADR_LEN        = 14
@@ -56,7 +56,7 @@ SPREAD_LTF_MAX = 0.38
 SPREAD_LTF_adapt = SPREAD_LTF_MIN + (1.0 - er_ltf) * (SPREAD_LTF_MAX - SPREAD_LTF_MIN)
 
 // ───────────────────────── 5m structure + 5m close for Q‑VWAP trigger ─────────────────────────
-ltfPivotLen = 5
+ltfPivotLen = input.int(5, "LTF pivot length (5/30/60)", minval=3, maxval=12)
 ph_5 = request.security(syminfo.tickerid, "5",  ta.pivothigh(high, ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
 pl_5 = request.security(syminfo.tickerid, "5",  ta.pivotlow (low,  ltfPivotLen, ltfPivotLen), barmerge.gaps_off, barmerge.lookahead_off)
 hh_5 = not na(ta.valuewhen(not na(ph_5), ph_5, 0)) and not na(ta.valuewhen(not na(ph_5), ph_5, 1)) and ta.valuewhen(not na(ph_5), ph_5, 0) > ta.valuewhen(not na(ph_5), ph_5, 1)
@@ -221,10 +221,9 @@ stb_1h_i = request.security(stableSym, "60",  dom_pulse_inst(lookback), barmerge
 stb_4h_i = request.security(stableSym, "240", dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
 stb_1d_i = request.security(stableSym, "D",   dom_pulse_inst(lookback), barmerge.gaps_off, barmerge.lookahead_off)
 
-// 1H debounce with Monday override
-overrideMacro1h = (mon_state == "reclaim_inside") and allowSweep
-oth_1h = overrideMacro1h ? oth_1h_i : (oth_1h_i != 0 and oth_1h_i == nz(oth_1h_i[1]) ? oth_1h_i : 0)
-stb_1h = overrideMacro1h ? stb_1h_i : (stb_1h_i != 0 and stb_1h_i == nz(stb_1h_i[1]) ? stb_1h_i : 0)
+// 1H debounce 
+oth_1h = (oth_1h_i != 0 and oth_1h_i == nz(oth_1h_i[1]) ? oth_1h_i : 0)
+stb_1h = (stb_1h_i != 0 and stb_1h_i == nz(stb_1h_i[1]) ? stb_1h_i : 0)
 
 // 4H/1D instantaneous
 oth_4h = oth_4h_i
@@ -237,7 +236,7 @@ P_STABLES = 0.10*stb_1h + 0.30*stb_4h + 0.60*stb_1d
 macro_raw = P_OTHERS - P_STABLES
 
 rating_raw = 5.0 + 2.5 * macro_raw
-rating_s   = nz(ta.ema(rating_raw, 2), rating_raw)
+rating_s   = nz(ta.ema(rating_raw, 3), rating_raw)
 rsiMacroD  = request.security(macroRSISym, "D", ta.rsi(close, macroRSILen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 adj_total3 = macroRSIpts * tanhN((rsiMacroD - 50.0) / 10.0)
 if math.abs(macro_raw) == 0.0 or math.abs(rating_s - 5.0) < 0.2
@@ -279,8 +278,8 @@ loc_long_det  = (longLocA and longLocB)  ? 0.6 : ((longLocA != longLocB)  ? 0.3 
 loc_short_det = (shortLocA and shortLocB) ? 0.6 : ((shortLocA != shortLocB) ? 0.3 : 0.0)
 
 // HTF triggers = daily EMA‑12 reclaim/loss
-htf_trig_long_bonus  = ema12_reclaim ? 0.4 : 0.0
-htf_trig_short_bonus = ema12_loss    ? 0.4 : 0.0
+htf_trig_long_bonus  = ema12_reclaim ? 0.5 : 0.0
+htf_trig_short_bonus = ema12_loss    ? 0.5 : 0.0
 
 // Monday bias credit
 bias_long_det  = (mon_state == "reclaim_inside" and mon_state_prev == "dev_below") ? 0.2 : 0.0
@@ -297,12 +296,16 @@ midZone = str.contains(qv_state, "mid")
 antiChaseLong  = (adrPct >= ADR_PCT_GATE) and (close_4H > (qvwap4H + qBand4H)) and (qSlope4H <= 0 or flatSlope)
 antiChaseShort = (adrPct >= ADR_PCT_GATE) and (close_4H < (qvwap4H - qBand4H)) and (qSlope4H >= 0 or flatSlope)
 
-pen_long_det  = (midZone ? -0.2 : 0.0) - (antiChaseLong  ? ANTICHASE_PEN : 0.0)
-pen_short_det = (midZone ? -0.2 : 0.0) - (antiChaseShort ? ANTICHASE_PEN : 0.0)
+pen_long_det  = (midZone ? -0.1 : 0.0) - ((adrPct >= 90.0 and close_4H > (qvwap4H + qBand4H) and flatSlope)  ? 0.15 : 0.0)
+pen_short_det = (midZone ? -0.1 : 0.0) - ((adrPct >= 90.0 and close_4H < (qvwap4H - qBand4H) and flatSlope) ? 0.15 : 0.0)
+
+// HTF-only location weights (LTF keeps the original loc_* values)
+loc_long_det_htf  = (longLocA and longLocB)  ? 0.70 : ((longLocA != longLocB)  ? 0.35 : 0.0)
+loc_short_det_htf = (shortLocA and shortLocB) ? 0.70 : ((shortLocA != shortLocB) ? 0.35 : 0.0)
 
 // HTF ratings (clamped 4.2..9.9)
-rating_long_det  = clampBand42_99(5.0 + structure_long_det  + loc_long_det  + htf_trig_long_bonus  + bias_long_det  + pen_long_det)
-rating_short_det = clampBand42_99(5.0 + structure_short_det + loc_short_det + htf_trig_short_bonus + bias_short_det + pen_short_det)
+rating_long_det  = clampBand42_99(5.0 + structure_long_det  + loc_long_det_htf  + htf_trig_long_bonus  + bias_long_det  + pen_long_det)
+rating_short_det = clampBand42_99(5.0 + structure_short_det + loc_short_det_htf + htf_trig_short_bonus + bias_short_det + pen_short_det)
 
 // LTF votes = 5m structure + 30/60 EMA‑100 fast‑path + triggers
 lt_votes_long  = (hh_5 or hl_5  ? 1 : 0) + (state30=="above" ? 1 : 0) + (state60=="above" ? 1 : 0)
@@ -340,9 +343,9 @@ string htf_sig_raw = rating_long_det  >= SIG_THRESH_HTF and (rating_long_det  - 
 // HTF micro‑hysteresis: require the stronger rating to actually be moving (±0.05 over 2 bars)
 slopeHTF_long  = rating_long_det  - nz(rating_long_det[2])
 slopeHTF_short = rating_short_det - nz(rating_short_det[2])
-if htf_sig_raw == "BUY"  and slopeHTF_long  < 0.05
+if htf_sig_raw == "BUY"  and slopeHTF_long  < 0.04
     htf_sig_raw := "HOLD"
-if htf_sig_raw == "SELL" and slopeHTF_short > -0.05
+if htf_sig_raw == "SELL" and slopeHTF_short > -0.04
     htf_sig_raw := "HOLD"
 
 var string htf_sig = "HOLD"
@@ -458,3 +461,4 @@ if barstate.isconfirmed and aplus_long and canEmitLong
 if barstate.isconfirmed and aplus_short and canEmitShort
     lastA_Short := dIndex
     alert("{\"type\":\"WWASD_A_PLUS\",\"symbol\":\"" + syminfo.ticker + "\",\"dir\":\"SHORT\",\"rating\":" + fmt1(htf_rating) + "}", alert.freq_once_per_bar_close)
+
