@@ -1,0 +1,270 @@
+//@version=6
+indicator("WWASD_State_Emitter_PLUS40_TEST", overlay=true, scale=scale.none)
+
+// ───────────────────────── Inputs (minimal; no desk knobs) ─────────────────────────
+useDailyVWAP = input.bool(true, "Include Daily VWAP checks")
+lookback     = input.int(20, "Structure Lookback (bars)", minval=5)
+
+othersSym   = input.symbol("CRYPTOCAP:OTHERS.D",   "OTHERS.D")
+stableSym   = input.symbol("CRYPTOCAP:STABLE.C.D", "STABLE.C.D")
+macroWeight = input.float(0.0,  "Macro bleed into micro (0..0.3)", minval=0.0, maxval=0.3, step=0.05)
+
+// ───────────────────────── Constants ─────────────────────────
+float EPS = 1e-10
+int   ADR_LEN = 14
+int   MACRO_RSI_LEN = 14
+
+// ───────────────────────── Helpers ─────────────────────────
+f_round2(float x) =>
+    math.round(x * 100.0) / 100.0
+
+fmt1(float x) =>
+    str.tostring(x, "#.0")
+
+fmt2(float x) =>
+    str.tostring(x, "#.00")
+
+fmt4(float x) =>
+    str.tostring(x, "#.0000")
+
+f_bool(bool b) =>
+    b ? "true" : "false"
+
+f_side(float c, float v) =>
+    c > v ? "above" : c < v ? "below" : "at"
+
+f_sig(float score, float margin) =>
+    score > 5.0 + margin ? "BUY" : score < 5.0 - margin ? "SELL" : "HOLD"
+
+f_rating_from_delta(float delta) =>
+    math.max(0.0, math.min(10.0, 5.0 + delta))
+
+f_recent(bool cond, int bars) =>
+    ta.barssince(cond) >= 0 and ta.barssince(cond) <= bars
+
+f_cross_reclaim(float c, float ref) =>
+    ta.crossover(c, ref)
+
+f_cross_loss(float c, float ref) =>
+    ta.crossunder(c, ref)
+
+f_push_state(float c, float p) =>
+    c > p ? 1 : c < p ? -1 : 0
+
+// ───────────────────────── Daily pct-change helper (consolidated request) ─────────────────────────
+pct_change_daily(string sym) =>
+    [c, c1] = request.security(sym, "D", [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off)
+    na(c1) or c1 == 0.0 ? 0.0 : ((c / c1) - 1.0) * 100.0
+
+// ───────────────────────── Active timeframe context ─────────────────────────
+tfActive = timeframe.period
+cmp = close
+
+// ───────────────────────── ER stack ─────────────────────────
+er_len = 10
+f_er(int len) =>
+    net = math.abs(close - close[len])
+    den = ta.sum(math.abs(close - close[1]), len)
+    den > EPS ? net / den : 0.0
+
+[er5, er30, er60] = request.security(syminfo.tickerid, "5", [f_er(er_len), f_er(er_len), f_er(er_len)], barmerge.gaps_off, barmerge.lookahead_off)
+// Correct per-TF values below (single request each; total remains well below Plus limit)
+er5  := request.security(syminfo.tickerid, "5",  f_er(er_len), barmerge.gaps_off, barmerge.lookahead_off)
+er30 := request.security(syminfo.tickerid, "30", f_er(er_len), barmerge.gaps_off, barmerge.lookahead_off)
+er60 := request.security(syminfo.tickerid, "60", f_er(er_len), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 5m structure/pivots ─────────────────────────
+ltfPivotLen = 5
+[ph5, pl5, c5, c5_1, c5_2] = request.security(syminfo.tickerid, "5", [ta.pivothigh(high, ltfPivotLen, ltfPivotLen), ta.pivotlow(low, ltfPivotLen, ltfPivotLen), close, close[1], close[2]], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 30m stack ─────────────────────────
+[ema12_30, ema26_30, c30, ph30, pl30] = request.security(syminfo.tickerid, "30", [ta.ema(close, 12), ta.ema(close, 26), close, ta.pivothigh(high, 5, 5), ta.pivotlow(low, 5, 5)], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 60m stack ─────────────────────────
+[ema12_60, ema26_60, c60, ph60, pl60] = request.security(syminfo.tickerid, "60", [ta.ema(close, 12), ta.ema(close, 26), close, ta.pivothigh(high, 5, 5), ta.pivotlow(low, 5, 5)], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 4H structure + qVWAP inputs ─────────────────────────
+[ph4H, pl4H, c4H, atr4H, qvwap4H] = request.security(syminfo.tickerid, "240", [ta.pivothigh(high, 5, 5), ta.pivotlow(low, 5, 5), close, ta.atr(14), ta.vwap(hlc3)], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── 12H structure ─────────────────────────
+[ph12H, pl12H] = request.security(syminfo.tickerid, "720", [ta.pivothigh(high, 5, 5), ta.pivotlow(low, 5, 5)], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── Daily stack ─────────────────────────
+[phD, plD, cD, ema100D, ema12D, cD1, ema12D1, dayHigh, dayLow, adrD, barIdxD] = request.security(syminfo.tickerid, "D", [ta.pivothigh(high, 5, 5), ta.pivotlow(low, 5, 5), close, ta.ema(close, 100), ta.ema(close, 12), close[1], ta.ema(close, 12)[1], high, low, ta.atr(ADR_LEN), bar_index], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── Monday range + 15m references ─────────────────────────
+[monHighD, monLowD, dowD] = request.security(syminfo.tickerid, "D", [high, low, dayofweek], barmerge.gaps_off, barmerge.lookahead_off)
+monHigh = ta.valuewhen(dowD == dayofweek.monday, monHighD, 0)
+monLow  = ta.valuewhen(dowD == dayofweek.monday, monLowD, 0)
+[c15, h15, l15] = request.security(syminfo.tickerid, "15", [close, high, low], barmerge.gaps_off, barmerge.lookahead_off)
+
+mon_state = "inside"
+if not na(monHigh) and not na(monLow)
+    mon_state := c15 > monHigh ? "above" : c15 < monLow ? "below" : "inside"
+    if c15 <= monHigh and c15[1] > monHigh
+        mon_state := "loss_inside"
+    else if c15 >= monLow and c15[1] < monLow
+        mon_state := "reclaim_inside"
+
+// ───────────────────────── Macro pulse ─────────────────────────
+othersD = pct_change_daily(othersSym)
+stableD = pct_change_daily(stableSym)
+macroDiff = othersD - stableD
+macroRsi = request.security("CRYPTOCAP:TOTAL3", "D", ta.rsi(close, MACRO_RSI_LEN), barmerge.gaps_off, barmerge.lookahead_off)
+macroDelta = math.max(-2.5, math.min(2.5, macroDiff * 0.35 + (macroRsi - 50.0) * 0.04))
+macroRating = f_rating_from_delta(macroDelta)
+macroSig = f_sig(macroRating, 0.25)
+
+// ───────────────────────── ADR ─────────────────────────
+dayRange = math.max(0.0, dayHigh - dayLow)
+adrPct = adrD > 0 ? (100.0 * dayRange / adrD) : 0.0
+
+// ───────────────────────── Daily VWAP (consolidated) ─────────────────────────
+[vwapD, cDV, cDV1] = request.security(syminfo.tickerid, "D", [ta.vwap(hlc3), close, close[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ───────────────────────── MTF EMA states ─────────────────────────
+[ema12_5, ema26_5] = request.security(syminfo.tickerid, "5", [ta.ema(close, 12), ta.ema(close, 26)], barmerge.gaps_off, barmerge.lookahead_off)
+[ema12_240, ema26_240] = request.security(syminfo.tickerid, "240", [ta.ema(close, 12), ta.ema(close, 26)], barmerge.gaps_off, barmerge.lookahead_off)
+[ema12_720, ema26_720] = request.security(syminfo.tickerid, "720", [ta.ema(close, 12), ta.ema(close, 26)], barmerge.gaps_off, barmerge.lookahead_off)
+
+ema_state_5   = ema12_5   > ema26_5   ? "above" : ema12_5   < ema26_5   ? "below" : "at"
+ema_state_30  = ema12_30  > ema26_30  ? "above" : ema12_30  < ema26_30  ? "below" : "at"
+ema_state_60  = ema12_60  > ema26_60  ? "above" : ema12_60  < ema26_60  ? "below" : "at"
+ema_state_240 = ema12_240 > ema26_240 ? "above" : ema12_240 < ema26_240 ? "below" : "at"
+ema_state_720 = ema12_720 > ema26_720 ? "above" : ema12_720 < ema26_720 ? "below" : "at"
+ema_state_D   = cD > ema100D ? "above" : cD < ema100D ? "below" : "at"
+
+// ───────────────────────── QVWAP / EMA12 / Daily VWAP states ─────────────────────────
+qvwapState = f_side(c4H, qvwap4H)
+qvwapReclaim = f_cross_reclaim(c4H, qvwap4H)
+qvwapLoss = f_cross_loss(c4H, qvwap4H)
+
+ema12StateD = f_side(cD, ema12D)
+ema12ReclaimD = cD > ema12D and cD1 <= ema12D1
+ema12LossD = cD < ema12D and cD1 >= ema12D1
+
+vwapStateD = useDailyVWAP ? f_side(cDV, vwapD) : "off"
+vwapReclaimD = useDailyVWAP ? (cDV > vwapD and cDV1 <= vwapD) : false
+vwapLossD = useDailyVWAP ? (cDV < vwapD and cDV1 >= vwapD) : false
+
+// ───────────────────────── Structural state helpers ─────────────────────────
+f_structure(float c, float ph, float pl) =>
+    string s = "inside"
+    if not na(ph) and c > ph
+        s := "break_up"
+    else if not na(pl) and c < pl
+        s := "break_down"
+    s
+
+struct5  = f_structure(c5, ph5, pl5)
+struct30 = f_structure(c30, ph30, pl30)
+struct60 = f_structure(c60, ph60, pl60)
+struct4H = f_structure(c4H, ph4H, pl4H)
+struct12H = f_structure(c4H, ph12H, pl12H)
+structD = f_structure(cD, phD, plD)
+
+// ───────────────────────── LTF momentum / reclaim logic ─────────────────────────
+ltfScore = 5.0
+ltfScore += ema12_5 > ema26_5 ? 0.8 : -0.8
+ltfScore += ema12_30 > ema26_30 ? 0.7 : -0.7
+ltfScore += ema12_60 > ema26_60 ? 0.5 : -0.5
+ltfScore += er5 > 0.35 ? 0.4 : 0.0
+ltfScore += er30 > 0.35 ? 0.3 : 0.0
+ltfScore += er60 > 0.35 ? 0.2 : 0.0
+ltfScore += struct5 == "break_up" ? 0.4 : struct5 == "break_down" ? -0.4 : 0.0
+ltfScore += struct30 == "break_up" ? 0.5 : struct30 == "break_down" ? -0.5 : 0.0
+ltfScore += struct60 == "break_up" ? 0.5 : struct60 == "break_down" ? -0.5 : 0.0
+ltfScore += macroWeight * (macroRating - 5.0)
+ltf_rating = math.max(0.0, math.min(10.0, ltfScore))
+ltf_sig = f_sig(ltf_rating, 0.30)
+
+// ───────────────────────── HTF rating ─────────────────────────
+htfScore = 5.0
+htfScore += ema12_240 > ema26_240 ? 1.0 : -1.0
+htfScore += ema12_720 > ema26_720 ? 0.7 : -0.7
+htfScore += cD > ema100D ? 1.0 : -1.0
+htfScore += cD > ema12D ? 0.5 : -0.5
+htfScore += struct4H == "break_up" ? 0.5 : struct4H == "break_down" ? -0.5 : 0.0
+htfScore += struct12H == "break_up" ? 0.5 : struct12H == "break_down" ? -0.5 : 0.0
+htfScore += structD == "break_up" ? 0.6 : structD == "break_down" ? -0.6 : 0.0
+htfScore += qvwapState == "above" ? 0.4 : qvwapState == "below" ? -0.4 : 0.0
+htfScore += adrPct > 140 ? -0.3 : adrPct < 60 ? 0.2 : 0.0
+htfScore += macroWeight * (macroRating - 5.0)
+htf_rating = math.max(0.0, math.min(10.0, htfScore))
+htf_sig = f_sig(htf_rating, 0.30)
+
+// ───────────────────────── Trend summary ─────────────────────────
+trendDiff = othersD - stableD
+trendRating = f_rating_from_delta(math.max(-2.5, math.min(2.5, trendDiff * 0.4)))
+trendSig = f_sig(trendRating, 0.25)
+
+// ───────────────────────── Trigger labeling ─────────────────────────
+string trigger = "none"
+if qvwapReclaim
+    trigger := "qvwap_reentry"
+else if qvwapLoss
+    trigger := "qvwap_loss"
+else if ema12ReclaimD
+    trigger := "ema12_1d_reclaim"
+else if ema12LossD
+    trigger := "ema12_1d_loss"
+else if vwapReclaimD
+    trigger := "vwap_1d_reclaim"
+else if vwapLossD
+    trigger := "vwap_1d_loss"
+else if struct30 == "break_up"
+    trigger := "30m_break_up"
+else if struct30 == "break_down"
+    trigger := "30m_break_down"
+
+// ───────────────────────── Reclaim/loss booleans for desk ─────────────────────────
+reclaim30 = not na(ph30) and c30 > ph30 and c30[1] <= ph30
+loss30    = not na(pl30) and c30 < pl30 and c30[1] >= pl30
+reclaim60 = not na(ph60) and c60 > ph60 and c60[1] <= ph60
+loss60    = not na(pl60) and c60 < pl60 and c60[1] >= pl60
+
+// ───────────────────────── Anti-chase / extension ─────────────────────────
+ext4H = atr4H > 0 ? math.abs(c4H - qvwap4H) / atr4H : 0.0
+chaseRisk = ext4H > 1.6 or adrPct > 145
+
+// ───────────────────────── JSON payload helpers ─────────────────────────
+mtfJson = "{\"5\":{\"ema\":\"" + ema_state_5 + "\",\"structure\":\"" + struct5 + "\",\"er\":" + fmt2(er5) + "}," +
+          "\"30\":{\"ema\":\"" + ema_state_30 + "\",\"structure\":\"" + struct30 + "\",\"er\":" + fmt2(er30) + ",\"reclaim\":" + f_bool(reclaim30) + ",\"loss\":" + f_bool(loss30) + "}," +
+          "\"60\":{\"ema\":\"" + ema_state_60 + "\",\"structure\":\"" + struct60 + "\",\"er\":" + fmt2(er60) + ",\"reclaim\":" + f_bool(reclaim60) + ",\"loss\":" + f_bool(loss60) + "}," +
+          "\"240\":{\"ema\":\"" + ema_state_240 + "\",\"structure\":\"" + struct4H + "\"}," +
+          "\"720\":{\"ema\":\"" + ema_state_720 + "\",\"structure\":\"" + struct12H + "\"}," +
+          "\"1D\":{\"ema\":\"" + ema_state_D + "\",\"structure\":\"" + structD + "\"}}"
+
+ctxJson = "{\"mon_state\":\"" + mon_state + "\",\"adr_pct\":" + fmt1(adrPct) + ",\"chase_risk\":" + f_bool(chaseRisk) + "}"
+trendJson = "{\"sig\":\"" + trendSig + "\",\"rating\":" + fmt1(trendRating) + ",\"source\":\"OTHERS_vs_STABLE\"}"
+htfJson = "{\"sig\":\"" + htf_sig + "\",\"rating\":" + fmt1(htf_rating) + "}"
+ltfJson = "{\"sig\":\"" + ltf_sig + "\",\"rating\":" + fmt1(ltf_rating) + ",\"trigger\":\"" + trigger + "\"}"
+
+compJson = "{\"ind\":{" +
+           "\"qvwap_4h\":{\"v\":" + fmt4(qvwap4H) + ",\"state\":\"" + qvwapState + "\",\"reclaim\":" + f_bool(qvwapReclaim) + ",\"loss\":" + f_bool(qvwapLoss) + "}," +
+           "\"ema12_1d\":{\"v\":" + fmt4(ema12D) + ",\"state\":\"" + ema12StateD + "\",\"reclaim\":" + f_bool(ema12ReclaimD) + ",\"loss\":" + f_bool(ema12LossD) + "}," +
+           "\"vwap_1d\":{\"v\":" + fmt4(vwapD) + ",\"state\":\"" + vwapStateD + "\",\"reclaim\":" + f_bool(vwapReclaimD) + ",\"loss\":" + f_bool(vwapLossD) + "}," +
+           "\"rsi\":{\"macro\":" + fmt1(macroRsi) + "}}}"
+
+// ───────────────────────── Main state alert ─────────────────────────
+payload = "{\"type\":\"WWASD_STATE\",\"symbol\":\"" + syminfo.ticker + "\",\"tf_active\":\"" + tfActive + "\",\"ts\":" + str.tostring(time) + ",\"cmp\":" + fmt4(cmp) + ",\"mtf\":" + mtfJson + ",\"ctx\":" + ctxJson + ",\"trend\":" + trendJson + ",\"htf\":" + htfJson + ",\"ltf\":" + ltfJson + ",\"comp\":" + compJson + "}"
+
+if barstate.isconfirmed
+    alert(payload, alert.freq_once_per_bar_close)
+
+// ───────────────────────── A+ events ─────────────────────────
+aplus_long = htf_rating >= 7.5 and ltf_rating >= 7.0 and qvwapState == "above" and not chaseRisk
+aplus_short = htf_rating <= 2.5 and ltf_rating <= 3.0 and qvwapState == "below" and not chaseRisk
+
+var int lastA_Long = na
+var int lastA_Short = na
+dIndex = barIdxD
+canEmitLong = na(lastA_Long) or dIndex != lastA_Long
+canEmitShort = na(lastA_Short) or dIndex != lastA_Short
+
+if barstate.isconfirmed and aplus_long and canEmitLong
+    lastA_Long := dIndex
+    alert("{\"type\":\"WWASD_A_PLUS\",\"symbol\":\"" + syminfo.ticker + "\",\"dir\":\"LONG\",\"rating\":" + fmt1(htf_rating) + "}", alert.freq_once_per_bar_close)
+if barstate.isconfirmed and aplus_short and canEmitShort
+    lastA_Short := dIndex
+    alert("{\"type\":\"WWASD_A_PLUS\",\"symbol\":\"" + syminfo.ticker + "\",\"dir\":\"SHORT\",\"rating\":" + fmt1(htf_rating) + "}", alert.freq_once_per_bar_close)
